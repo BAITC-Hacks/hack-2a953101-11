@@ -1,147 +1,318 @@
-# Warehouse replenishment
+# Электрокомплект — планирование закупок
 
-Go application with a Russian-language purchasing dashboard for Электрокомплект: import sales, stock, suppliers, and open shipments; calculate proposed purchase orders grouped by supplier; remove exceptional sales spikes from regular demand; export orders to CSV for Excel.
+Веб-приложение для расчёта заказов поставщикам на пополнение склада. По истории продаж, остаткам и товарам в пути сервис оценивает регулярный спрос, корректирует разовые всплески и предлагает объём закупки с учётом сроков поставки, сезонности, минимального заказа и кратности упаковки.
 
-## Run locally
+Менеджер получает рекомендации по каждому товару, объяснение расчёта и CSV с заказами, сгруппированными по поставщикам. Формирование рекомендаций и экспорт не отправляют заказы поставщикам и не создают новые поставки.
 
-Requires Go 1.23+; there are no external Go dependencies. Use a supported Go release for deployment.
+**Стек:** Go, стандартный `net/http`, HTML/CSS/JavaScript без фреймворков, файловое JSON-хранилище. Интерфейс встроен в Go-бинарник через `go:embed`; отдельный сервер фронтенда и база данных для запуска не нужны. Конвертер Excel написан на Python со стандартной библиотекой.
+
+## Содержание
+
+- [Быстрый запуск](#быстрый-запуск)
+- [Работа в интерфейсе](#работа-в-интерфейсе)
+- [Как рассчитывается заказ](#как-рассчитывается-заказ)
+- [Импорт Excel: IEK и Systeme Electric](#импорт-excel-iek-и-systeme-electric)
+- [Формат данных](#формат-данных)
+- [HTTP API](#http-api)
+- [Настройки и Docker](#настройки-и-docker)
+- [Структура проекта](#структура-проекта)
+- [Проверки и тесты](#проверки-и-тесты)
+- [Ограничения и частые вопросы](#ограничения-и-частые-вопросы)
+
+## Быстрый запуск
+
+Требуется **Go 1.23 или новее**, согласно [go.mod](go.mod). Все команды ниже выполняются из корня репозитория.
 
 ```sh
 go run .
 ```
 
-Open **http://127.0.0.1:8080** for the dashboard. The HTML, CSS, and JavaScript are embedded in the Go binary; no frontend build or Node server is needed. The same UI is included in the Docker image.
+Откройте **http://127.0.0.1:8080**. По умолчанию сервис доступен только с локального компьютера, а данные сохраняются в `data/warehouse.json`. Node.js нужен только для проверок интерфейса.
 
-### Dashboard workflow
+Для первого знакомства нажмите **«Попробовать демо»** на пустом складе и подтвердите загрузку. Это создаст шесть товаров, 30 дней продаж и примеры всплесков спроса. Демоданные записываются в хранилище после подтверждения.
 
-- On an empty warehouse, choose **Попробовать демо** and confirm to load a six-product demo with 30 days of sales and three spikes. The demo is stored only after confirmation; it is never loaded automatically.
-- Choose **Загрузить данные** to import a JSON dataset. Review the record counts and confirm replacement. Existing data can be downloaded as a backup before replacement. Imports also accept the GET dataset response wrapper.
-- Adjust the planning date, sales window, review period, and safety days under **Параметры расчёта**. Stock must describe the warehouse on the selected date.
-- Filter recommendations by supplier, name, supplier SKU, 1C code, or attention status. Catalogues are paginated at 100 products per page. The arrow on each product opens its calculation, spike adjustments, and warnings. **Товары и остатки** shows all products; **Товары в пути** shows open/overdue shipments.
-- **Экспорт CSV** downloads all current recommended order lines, regardless of table filters, with a UTF-8 BOM for Excel. An export is rejected if the warehouse changed since the displayed calculation.
-- If `API_KEY` is configured, the page remains public but warehouse data requires the key. Use **Подключение** to enter it; the key stays in tab memory, never local/session storage, and must be re-entered after reload.
-
-Charts sum quantities across product base units for an overview; procurement calculations still run separately for each product. The dashboard is responsive, supports keyboard navigation and reduced motion, and uses local assets without external fonts or scripts.
-
-The API listens on `http://127.0.0.1:8080` and persists data to `data/warehouse.json`. In a separate terminal, load the example into a **new** instance (revision 0):
+Сборка и запуск отдельного бинарника:
 
 ```sh
-curl -i http://127.0.0.1:8080/api/v1/dataset
-curl --fail-with-body -X PUT http://127.0.0.1:8080/api/v1/dataset \
-  -H 'Content-Type: application/json' -H 'If-Match: "0"' \
-  --data-binary @examples/dataset.json
-curl --fail-with-body http://127.0.0.1:8080/api/v1/recommendations \
-  -H 'Content-Type: application/json' \
-  --data-binary @examples/recommendation.json
-curl --fail-with-body http://127.0.0.1:8080/api/v1/recommendations.csv \
-  -H 'Content-Type: application/json' \
-  --data-binary @examples/recommendation.json -o /tmp/supplier-orders.csv
+go build -o bin/backend .
+./bin/backend
 ```
 
-Expected demo: cable demand drops from approximately 88.57 to 20 units/day after adjusting the 500-unit sale to the 20-unit baseline. Order **220 cable units** and **100 lamps**; breakers have enough stock and generate no order. Re-imports require the current `ETag` from GET; stale writes return 412.
+После изменений HTML, CSS или JavaScript бинарник нужно пересобрать: файлы интерфейса включаются в него во время сборки.
 
-## API
+## Работа в интерфейсе
 
-All API responses and imports use JSON except CSV exports. Dates use `YYYY-MM-DD`; quantities are numeric values in each product's base unit, including fractional metres; sales may be signed net quantities to preserve returns/corrections. Application errors use `{"error":{"code":"...","message":"..."}}`; unmatched routes and unsupported methods use standard HTTP 404/405 responses.
+1. Нажмите **«Загрузить данные»** и выберите JSON. Проверьте количество записей в предварительном просмотре и подтвердите замену. Перед заменой можно скачать текущие данные как резервную копию.
+2. Откройте **«Параметры расчёта»**: задайте дату, глубину истории, период закупки и страховой запас. Здесь же можно подтвердить сроки поставщиков; они сохраняются в данных склада.
+3. Изучите рекомендации. Доступны поиск по названию, артикулу и коду 1С, фильтры по поставщику и статусу. В подробностях товара показаны спрос, остаток, поставки, корректировки продаж и причины предупреждений.
+4. Проверьте вкладку **«Требуют внимания»**. Она включает товары с предупреждениями или корректировками. Часть предупреждений блокирует заказ до исправления исходных данных. Разделы **«Товары и остатки»** и **«Товары в пути»** помогают проверить склад и ожидаемые поступления.
+5. Нажмите **«Экспорт CSV»**. Выгружаются все готовые строки заказа, независимо от фильтров таблицы. Если данные изменились после расчёта, интерфейс попросит пересчитать рекомендации.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/healthz` | Process liveness, public |
-| GET | `/readyz` | Startup completed and stored snapshot validated, public |
-| GET | `/api/v1/dataset` | Complete snapshot, revision, update time; revision also in `ETag` |
-| PUT | `/api/v1/dataset` | Atomically replace the complete dataset; requires `If-Match` |
-| POST | `/api/v1/recommendations` | Supplier orders and explanations for every product |
-| POST | `/api/v1/recommendations.csv` | Same calculation exported as supplier order lines |
+Интерфейс принимает как сам набор данных, так и JSON-ответ `GET /api/v1/dataset`. Каталог выводится страницами по 100 товаров. CSV из интерфейса содержит UTF-8 BOM для открытия в Excel; текстовые ячейки защищены от интерпретации как формулы.
 
-PUT accepts the dataset itself, as in `examples/dataset.json`, rather than the GET response wrapper. All five arrays are required; use `[]` for empty collections. A missing stock row is rejected rather than treated as an empty warehouse. Each product belongs to one supplier. Each product/date pair must have one aggregated sales row; duplicated daily rows, unknown references, negative stock/shipments, invalid dates, and reserved quantities above stock are rejected. `pack_size` is required and positive; `min_order_quantity` defaults to zero. Import limit: 64 MiB. This is a full replacement, so fetch, edit, and submit the complete snapshot when changing one record.
+Если задан `API_KEY`, в разделе подключения нужно ввести ключ доступа. Он хранится только в памяти вкладки и после перезагрузки вводится заново. Сама страница интерфейса доступна без ключа, данные склада — с ключом.
 
-POST accepts `{}` for defaults: today's UTC date, 90 history days, 14 review days, 7 safety days. Override with:
+## Как рассчитывается заказ
 
-```json
-{"as_of":"2026-09-08","lookback_days":7,"review_period_days":7,"safety_stock_days":2}
-```
+Расчёт выполняется отдельно для каждого товара. Основная логика находится в [planner.go](internal/planning/planner.go).
 
-Lookback: 7–730 days; review: 1–365 days; safety: 0–365 days; supplier lead time: 0–365 days. Raw imported quantities and pack/minimum sizes are capped at 1 billion units per record. Returned order quantities can exceed that cap. The JSON response includes `dataset_revision`, `parameters`, history boundaries, `orders` (only positive quantities), and `products` (including products needing no order). Each line exposes raw/adjusted demand, stock, counted/overdue shipments, target stock, net requirement, final order quantity, adjustments, and warning codes. Responses also include `X-Dataset-Revision`.
+1. **Выбирается история.** Используются полные дни до даты расчёта: `[as_of − lookback_days, as_of)`. Если заданы границы `source.history_start` и `source.history_end`, период ограничивается известной историей; последняя дата источника включается. Дни без продаж внутри этого периода считаются нулевыми. Продажи за дату расчёта и последующие дни не учитываются.
+2. **Обрабатываются исключения и возвраты.** Продажи с `exclude_from_demand: true` и отрицательные дневные количества дают нулевой вклад в регулярный спрос. Исходные значения остаются в необработанном спросе и пояснениях.
+3. **Корректируются всплески.** При наличии хотя бы четырёх положительных дней без ручного исключения рассчитываются медиана и MAD — медиана абсолютных отклонений. Количество, строго превышающее порог ниже, заменяется медианой:
 
-## Calculation rules
+   ```text
+   порог = max(3 × медиана, медиана + 3 × 1,4826 × MAD)
+   ```
 
-1. Use complete calendar days in `[as_of - lookback_days, as_of)`, intersected with `source.history_start`/`source.history_end` when supplied. Missing sales days **within that known coverage** count as zero; unknown days outside it are excluded from the denominator. Today's partial sales and future sales are ignored. Negative daily net sales are retained in raw demand but contribute zero to replenishment demand, with an explicit `net_returns` adjustment.
-2. Explicitly marked `exclude_from_demand: true` sales contribute zero to regular demand. They remain visible in raw demand and the adjustment audit.
-3. With at least four positive, unexcluded days, calculate their median and median absolute deviation (MAD). A daily quantity strictly above `max(3 × median, median + 3 × 1.4826 × MAD)` is replaced with the median. This removes the exceptional portion while retaining normal daily demand. With fewer observations, retain sales and return `insufficient_positive_days_for_spike_detection`.
-4. Divide adjusted sales by observed calendar days, including zeros. Coverage is supplier lead time + review period + safety days. With a supplied 12-month supplier profile, de-seasonalize each adjusted historical day, then apply each future day's monthly factor across the coverage horizon. `daily_demand` remains historical regular demand; `forecast_daily_demand` and `seasonal_factor` explain the projected demand. Target stock is the ceiling of projected coverage demand. Without a profile, the original average-demand calculation applies.
-5. Available stock is `on_hand - reserved`. Count open shipments due between `as_of` and `as_of + coverage` inclusive. Overdue shipments are excluded and flagged; later shipments do not cover this order horizon.
-6. Net requirement is `max(0, target - available - incoming)`. A positive requirement is raised to the product minimum and rounded up to a full pack. No minimum is applied when the requirement is zero.
-7. Stock older than the day before `as_of` (or dated in the future), explicitly unverified stock, unconfirmed lead times, missing history, and product `review_reasons` block export. A blocked line exposes a provisional `suggested_quantity` but has `order_quantity: 0`. Group only positive, unblocked lines by supplier. Proposed arrival is `as_of + lead_time_days`. `insufficient_supply_during_lead_time` warns when available stock plus incoming supply due by that date cannot cover forecast average lead-time demand.
+4. **Оценивается будущий спрос.** Скорректированные продажи делятся на число календарных дней доступной истории. Если поставщик имеет 12 месячных коэффициентов сезонности, из исторических продаж сначала убирается сезонная составляющая, затем применяются коэффициенты каждого дня будущего горизонта.
+5. **Рассчитывается потребность.** Доступный остаток и ожидаемые поступления вычитаются из целевого запаса:
 
-These are transparent planning heuristics with optional supplier-level monthly seasonality. Complete source-history boundaries must be supplied accurately. Daily stockouts, new-product launch dates, price changes, weekday patterns, and promotions are not modeled; monthly opening balances cannot establish exact days of availability. Repeated project sales can dominate the median; use manual exclusion when business context identifies them. The lead-time warning is an aggregate check and cannot identify every temporary shortage before individual shipments arrive.
+   ```text
+   горизонт = срок поставки + период закупки + страховой запас, дней
+   целевой запас = округление вверх спроса за горизонт
+   доступный остаток = on_hand − reserved
+   потребность = max(0, целевой запас − доступный остаток − поступления)
+   ```
 
-Stock and shipments must describe the warehouse at `as_of`; selecting an earlier date does not reconstruct historical stock. Shipments represent only remaining, unreceived quantities. Upon receipt, update stock and remove/reduce that shipment in one snapshot import to avoid double counting. Recommendations are proposals; generating/exporting one neither sends it to a supplier nor records a new shipment.
+6. **Применяются правила заказа.** Положительная потребность повышается до `min_order_quantity` и округляется вверх до кратности `pack_size`. При нулевой потребности минимальный заказ не применяется.
+7. **Формируются заказы.** Положительные строки без блокировок группируются по поставщику. Ожидаемая дата нового заказа — дата расчёта плюс срок поставки.
 
+В поступления включаются открытые поставки с датой от `as_of` до конца горизонта включительно. Просроченные поставки отмечаются отдельно и не уменьшают потребность; поставки после горизонта также не учитываются.
 
-## Supplied IEK and Systeme Electric workbooks
+Поля `raw_daily_demand`, `daily_demand` и `forecast_daily_demand` показывают исходный, скорректированный исторический и прогнозный спрос. `adjustments` объясняет изменения отдельных продаж, `warnings` содержит коды предупреждений.
 
-All 12 source workbooks (14 sheets), including the IEK MOQ workbook at the repository root, were reviewed. See [the source review](docs/SUPPLIER_DATA_REVIEW.md) for mappings, discrepancies, and known limitations.
+### Когда заказ блокируется
 
-Prepare an import and detailed audit without modifying the live warehouse:
+| Причина | Что проверить |
+| --- | --- |
+| `lead_time_unconfirmed` | Подтвердить срок нового заказа у поставщика |
+| `stock_unverified` | Загрузить проверенный остаток |
+| `stock_snapshot_outdated` | Указанная дата остатка должна совпадать с датой расчёта или предыдущим днём |
+| `history_unavailable` | Запрошенный период должен пересекаться с доступной историей |
+| Непустой `product.review_reasons` | Исправить указанные проблемы артикула, единиц или правил заказа и удалить разрешённые причины |
+
+У заблокированного товара `blocked: true`, возможный объём показан в `suggested_quantity`, а `order_quantity` равен нулю. Такой товар не попадает в заказ и CSV.
+
+Пустой массив продаж сам по себе означает отсутствие продаж в известном периоде и не блокирует товар. Для совместимости дата остатка необязательна: проверка давности работает, только если заполнено `stock.as_of`. Поле `source.as_of` её не заменяет.
+
+Предупреждения о недостатке данных для поиска всплесков, просроченных поставках или возможном дефиците до поступления сами по себе заказ не блокируют.
+
+## Импорт Excel: IEK и Systeme Electric
+
+В репозитории есть конвертер предоставленных выгрузок: 12 Excel-файлов, 14 листов. Он рассчитан на конкретные таблицы из `IEK/`, `systemElectric/` и файл `MOQ  ИЭК.xlsx` в корне. Структура источников и расхождения описаны в [отчёте проверки](docs/SUPPLIER_DATA_REVIEW.md) на английском языке.
+
+Требуется Python 3; дополнительные пакеты не нужны:
 
 ```sh
 python3 scripts/import_supplier_workbooks.py
 ```
 
-This writes `data/supplier-import.json` (about 15 MB) and `data/supplier-import-report.json`. In the dashboard choose **Загрузить данные**, select `supplier-import.json`, review the preview, and confirm. The planning date becomes 23 September 2026, following the supplied snapshot/history date of 22 September. The data-quality banner and **Требуют внимания** view show blocked items; these are not exported as orders.
+Результаты:
 
-Standard lead times are absent from the workbooks. Enter confirmed values in **Параметры расчёта**; changes persist with the same revision checks as imports. Alternatively, pass explicitly confirmed values with `--iek-lead-days` and `--systeme-lead-days` when running the converter. They default to **unconfirmed**, not an assumed same-day delivery.
+| Файл | Содержимое |
+| --- | --- |
+| `data/supplier-import.json` | Набор данных для загрузки в приложение |
+| `data/supplier-import-report.json` | Аудит: файлы и SHA-256, строки листов, ошибки формул, проблемы сопоставления, сверка месячных итогов |
 
-IEK September stock is an opening balance dated **1 September**, so it cannot authorize orders on 23 September. Update the dataset with an actual current-stock export (`on_hand`, `reserved`, `as_of`) before clearing that block. For products with unresolved `review_reasons`, correct the article/order rules/unit conversion against the source and remove the resolved reasons in the JSON before importing. `pack_size` and `min_order_quantity` are expressed in the same base unit as stock and demand; do not combine reel counts with metres without a confirmed conversion.
+Результаты конвертации записываются только в файлы `--output` и `--report`; исходные книги и рабочий `data/warehouse.json` остаются без изменений. Конвертер читает сохранённые результаты Excel-формул без их выполнения. Дневные продажи агрегируются с учётом возвратов; месячные итоги используются для сверки и не добавляются к дневным повторно.
 
-The converter uses the Python standard library, streams worksheet XML, reads cached formula values without executing formulas, preserves leading zeros in 1C codes, and checks workbook snapshot dates. It reconciles monthly totals but does **not** add them to transaction totals. Full source documents and generated warehouse data are excluded from Docker builds. No workbook or existing live snapshot is rewritten.
+Для предоставленного набора ожидаются **3 909 товаров, 140 922 записи дневных продаж и 313 строк поставок**. Загрузите `supplier-import.json` через интерфейс. Дата расчёта автоматически станет **23 сентября 2026 года**, чтобы включить полные продажи по 22 сентября.
+
+Параметры конвертера:
+
+| Аргумент | По умолчанию | Назначение |
+| --- | --- | --- |
+| `--source` | `.` | Корень каталогов с исходными книгами |
+| `--as-of` | `2026-09-22` | Дата выгрузки остатков и поставок; должна совпадать с датой в именах файлов поставок |
+| `--history-start` | `2025-01-01` | Начало полной истории операций |
+| `--iek-lead-days` | Не подтверждён | Подтверждённый срок нового заказа IEK, 0–365 дней |
+| `--systeme-lead-days` | Не подтверждён | Подтверждённый срок нового заказа Systeme Electric, 0–365 дней |
+| `--output` | `data/supplier-import.json` | Путь результирующего набора |
+| `--report` | `data/supplier-import-report.json` | Путь аудита |
+
+В книгах отсутствуют стандартные сроки новых заказов, поэтому по умолчанию они требуют подтверждения. Их можно задать через аргументы конвертера или в **«Параметрах расчёта»** после импорта.
+
+Остатки IEK за сентябрь — начальное сальдо на **1 сентября**, а не текущий склад на 23 сентября. Для заказа нужно обновить `on_hand`, `reserved` и `as_of` по актуальной выгрузке. Для части товаров необходимо уточнить артикулы, MOQ или перевод бухт в метры. Исправления вносятся в JSON с последующей загрузкой; причины `review_reasons` удаляются после устранения соответствующей проблемы.
+
+## Формат данных
+
+Полный пример: [examples/dataset.json](examples/dataset.json). Схема и валидация реализованы в [model.go](internal/planning/model.go).
+
+| Поле | Назначение и основные атрибуты |
+| --- | --- |
+| `suppliers` | Поставщики: `id`, `name`, `lead_time_days`; дополнительно `lead_time_unconfirmed`, `seasonality` |
+| `products` | Товары: `id`, `sku`, `name`, `supplier_id`, `pack_size`, `min_order_quantity`; дополнительно `internal_code`, `unit`, `review_reasons` |
+| `sales` | Продажи по товару и дню: `product_id`, `date`, `quantity`, `exclude_from_demand` |
+| `stock` | Остатки: `product_id`, `on_hand`, `reserved`; дополнительно `as_of`, `unverified` |
+| `shipments` | Ещё не полученные поставки: `id`, `product_id`, `quantity`, `expected_date` |
+| `source` | Необязательные сведения об источнике: `label`, `as_of`, `history_start`, `history_end`, `warnings` |
+
+Правила импорта:
+
+- Все пять массивов обязательны; пустая коллекция задаётся как `[]`, а не `null`.
+- Каждый товар относится к одному существующему поставщику и должен иметь ровно одну запись остатка. Отсутствующий остаток не считается нулевым.
+- Для пары «товар + дата» допустима одна агрегированная запись продаж. Отрицательное количество сохраняет возвраты и корректировки.
+- Даты имеют формат `YYYY-MM-DD`. Границы истории источника указываются вместе; `history_end` включается в известную историю.
+- Количества могут быть дробными. Продажи, остатки, поставки, MOQ и кратность одного товара задаются в одной базовой единице измерения.
+- `pack_size` должен быть положительным, `min_order_quantity` — неотрицательным и по умолчанию равен нулю. Резерв должен находиться между нулём и остатком, количество поставки — быть положительным.
+- Импортируемые количества по модулю, MOQ и кратность ограничены 1 млрд на запись. Результирующий объём заказа может превышать этот предел.
+- `seasonality`, если задана непустой, содержит 12 коэффициентов с января по декабрь; каждый больше нуля и не больше 10.
+
+**Импорт полностью заменяет снимок склада.** Для изменения одной записи получите весь текущий набор, внесите правку и отправьте его с актуальной ревизией.
+
+## HTTP API
+
+| Метод | Путь | Назначение |
+| --- | --- | --- |
+| `GET` | `/healthz` | Проверка доступности процесса, без авторизации |
+| `GET` | `/readyz` | Проверка готовности после запуска и чтения хранилища, без авторизации |
+| `GET` | `/api/v1/dataset` | Снимок `{revision, updated_at, data}` и заголовок `ETag` |
+| `PUT` | `/api/v1/dataset` | Полная замена набора; обязателен `If-Match` |
+| `POST` | `/api/v1/recommendations` | Заказы по поставщикам и объяснения по всем товарам |
+| `POST` | `/api/v1/recommendations.csv` | Строки готовых заказов в CSV |
+
+Для запросов с JSON нужен `Content-Type: application/json`. API отклоняет неизвестные поля и тела больше 64 МиБ. При настроенном ключе добавляйте `Authorization: Bearer <API_KEY>` ко всем запросам `/api/v1/`.
+
+### Пример: загрузка, расчёт и экспорт
+
+Команды ниже рассчитаны на **новое локальное хранилище с ревизией 0**, без `API_KEY`. Сервер должен быть запущен в другом терминале.
 
 ```sh
-python3 -m unittest discover -s scripts -p 'test_*.py'
-SUPPLIER_IMPORT_FILE="$PWD/data/supplier-import.json" go test ./internal/planning -run TestActualSupplierImport -v
-# Include the actual import in isolated browser tests:
-SUPPLIER_IMPORT_FILE="$PWD/data/supplier-import.json" CHROME_BIN=/path/to/chrome npm run test:browser
+# Прочитать снимок и ETag.
+curl -i http://127.0.0.1:8080/api/v1/dataset
+
+# Загрузить пример в новое хранилище.
+curl --fail-with-body -X PUT http://127.0.0.1:8080/api/v1/dataset \
+  -H 'Content-Type: application/json' \
+  -H 'If-Match: "0"' \
+  --data-binary @examples/dataset.json
+
+# Рассчитать рекомендации на 8 сентября 2026 года.
+curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/recommendations \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/recommendation.json
+
+# Сохранить заказ в CSV.
+curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/recommendations.csv \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/recommendation.json \
+  -o /tmp/supplier-orders.csv
 ```
 
-The extended JSON model adds `supplier.seasonality` (12 positive monthly factors), `lead_time_unconfirmed`, product `internal_code`, `unit`, and `review_reasons`, stock `as_of`/`unverified`, and a `source` object with label, snapshot date, history boundaries, and audit warnings. Older datasets without these optional fields retain their original behavior. CSV export appends 1C code, unit, forecast demand, and seasonal factor.
+Файловый пример содержит три товара и отличается от демо интерфейса. Ожидаемый результат: **220 м кабеля, 100 ламп, без заказа автоматов**. После замены всплеска в 500 единиц медианой 20 спрос на кабель снижается примерно с 88,57 до 20 единиц в день.
 
-## Configuration and deployment
+Для повторного импорта используйте текущий `ETag` из `GET` в заголовке `If-Match`, включая кавычки. `PUT` принимает сам набор данных, без оболочки `{revision, updated_at, data}`.
 
-| Variable | Default | Purpose |
+### Параметры расчёта и ответы
+
+Пример тела запроса:
+
+```json
+{
+  "as_of": "2026-09-08",
+  "lookback_days": 7,
+  "review_period_days": 7,
+  "safety_stock_days": 2
+}
+```
+
+Пустой объект `{}` использует значения по умолчанию:
+
+| Параметр | По умолчанию | Допустимые значения |
 | --- | --- | --- |
-| `HTTP_ADDR` | `127.0.0.1:8080` | Listen address |
-| `DATA_FILE` | `data/warehouse.json` | Persistent snapshot path |
-| `API_KEY` | empty | Bearer token; required for non-loopback binding, minimum 24 characters |
-| `CORS_ORIGIN` | empty | One exact allowed browser origin, e.g. `http://localhost:3000` |
+| `as_of` | Сегодня по UTC | Дата `YYYY-MM-DD` |
+| `lookback_days` | 90 | 7–730 дней |
+| `review_period_days` | 14 | 1–365 дней |
+| `safety_stock_days` | 7 | 0–365 дней |
 
-When `API_KEY` is set, send `Authorization: Bearer <API_KEY>` with every `/api/v1/` request. Share this operator credential only with trusted operators; there are no per-user roles. The bundled dashboard adds the header after the operator enters the key. CORS exposes `ETag` and `X-Dataset-Revision` for separately hosted browser clients; the bundled UI uses the same origin.
+Срок поставщика `lead_time_days` хранится в наборе данных и допускает 0–365 дней.
+
+JSON-ответ содержит `dataset_revision`, параметры, границы истории, `orders` с готовыми заказами и `products` со всеми товарами, включая товары без потребности и с блокировками. Для обоих форматов расчёта возвращается заголовок `X-Dataset-Revision`. API отдаёт CSV в UTF-8 без BOM; интерфейс добавляет BOM при скачивании.
+
+Ошибки приложения имеют вид `{"error":{"code":"...","message":"..."}}`:
+
+| HTTP-код | Типичная причина |
+| --- | --- |
+| `400` | Некорректный JSON, неизвестное поле или неверный формат ревизии |
+| `401` | Не передан или неверен ключ доступа |
+| `412` | Данные изменились: требуется повторное чтение и актуальный `If-Match` |
+| `413` | Тело запроса больше 64 МиБ |
+| `415` | Отсутствует или неверен `Content-Type: application/json` |
+| `422` | Набор данных или параметры расчёта не прошли проверку |
+| `428` | Не передан `If-Match` при замене данных |
+
+Неизвестные маршруты и неподдерживаемые методы обрабатываются стандартными ответами HTTP `404` и `405` после проверки авторизации.
+
+## Настройки и Docker
+
+| Переменная | По умолчанию | Назначение |
+| --- | --- | --- |
+| `HTTP_ADDR` | `127.0.0.1:8080` | Адрес прослушивания |
+| `DATA_FILE` | `data/warehouse.json` | Путь снимка склада |
+| `API_KEY` | Пусто | Общий ключ оператора, минимум 24 символа, без пробелов по краям |
+| `CORS_ORIGIN` | Пусто | Один разрешённый origin для отдельного веб-клиента |
+
+Без ключа сервис запускается только на IP-адресе loopback. Для `0.0.0.0:8080` или `:8080` ключ обязателен. Встроенный интерфейс работает с API на одном origin, поэтому отдельная настройка CORS ему не требуется.
+
+Для Docker нужны Docker Compose и OpenSSL для генерации ключа:
 
 ```sh
 export API_KEY="$(openssl rand -hex 32)"
 docker compose up --build -d
-curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8080/api/v1/dataset
 docker compose logs -f backend
 ```
 
-The container runs as a non-root user and stores data in a named volume. Put a TLS reverse proxy in front of any public deployment. The build uses the [Go 1.26 release line](https://go.dev/doc/go1.26) and an [Alpine 3.23 runtime](https://alpinelinux.org/releases/).
+Откройте http://127.0.0.1:8080 и введите значение `API_KEY` в настройках подключения. Проверка API из того же терминала:
 
-Storage is an atomic JSON snapshot with an in-process lock, optimistic revision checks, file sync, and rename before publishing the new in-memory state. Failed writes leave the previous in-memory snapshot intact. Corrupt stored data fails startup. Run **one process/replica per data file**; this storage is intended for a small warehouse/hackathon deployment. It has no cross-process locking, database query layer, audit history, or replication, and rename metadata is not directory-synced against abrupt power failure. Back up the snapshot; use a transactional database before horizontal scaling or larger imports.
+```sh
+curl --fail-with-body \
+  -H "Authorization: Bearer $API_KEY" \
+  http://127.0.0.1:8080/api/v1/dataset
+```
 
-The service has structured JSON logs, bounded request bodies, HTTP timeouts, graceful SIGTERM shutdown, constant-time credential comparison, spreadsheet formula escaping, and exact-origin CORS. `/readyz` reflects startup readiness, not a continuous disk-writability check.
+[Dockerfile](Dockerfile) использует `golang:1.26-alpine` для сборки и `alpine:3.23` для запуска. Контейнер работает от непривилегированного пользователя. [compose.yaml](compose.yaml) публикует порт только на `127.0.0.1` хоста, сохраняет данные в томе `warehouse-data` и по умолчанию задаёт `CORS_ORIGIN=http://localhost:3000`.
 
-## Verification
+Остановка с сохранением тома:
+
+```sh
+docker compose down
+```
+
+Для внешнего доступа используйте HTTPS через обратный прокси. Авторизация общая для операторов: отдельных пользователей и ролей в приложении нет. Резервируйте файл снимка или том с данными.
+
+## Структура проекта
+
+```text
+main.go                         Запуск, настройки, HTTP-сервер и завершение работы
+internal/
+  planning/model.go             Модель и проверка данных
+  planning/planner.go           Расчёт спроса, потребности и заказов
+  storage/store.go              JSON-хранилище, ревизии и атомарная запись
+  httpapi/server.go             API, авторизация, CORS и CSV
+  webui/                        Встроенный интерфейс и его статические файлы
+scripts/                        Конвертер Excel и его тесты
+examples/                       Пример набора данных и запроса расчёта
+tests/browser.test.mjs          Сквозные тесты интерфейса
+docs/SUPPLIER_DATA_REVIEW.md     Отчёт о предоставленных данных
+IEK/, systemElectric/           Исходные Excel-выгрузки
+```
+
+Хранилище проверяет ревизию, записывает новый снимок во временный файл, синхронизирует его и переименовывает перед обновлением состояния в памяти. Чтение возвращает независимые копии. При ошибке записи прежнее состояние сохраняется; повреждённый снимок не позволяет запустить сервис.
+
+## Проверки и тесты
+
+Проверки Go, Python-конвертера и сборка:
 
 ```sh
 go test -race ./...
 go vet ./...
 go build -o bin/backend .
-# Optional, with a golangci-lint version compatible with your Go toolchain:
-golangci-lint run
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-Tests cover spike filtering, sparse/zero demand, explicit exclusions, date boundaries, incoming/overdue stock, reservation and pack rounding, supplier grouping, validation, cancellation, persistence/restart, concurrent revision conflicts, failed writes, API authentication/import/export, request limits, CORS, and spreadsheet injection. No external services are needed.
+Go-тесты проверяют спрос и всплески, сезонность, округление, поставки, блокировки, валидацию, сохранение и восстановление данных, конфликты ревизий, авторизацию, CSV и пример из README. Python-тесты проверяют чтение XLSX и преобразование исходных данных. В [Makefile](Makefile) есть команды `make run`, `make build`, `make test`, `make vet` и `make lint`; последняя требует отдельно установленного `golangci-lint`.
 
-Browser tests are optional development tooling (Node 20+). They start a separate backend with a temporary data file, exercise the real UI/API, and leave existing warehouse data untouched:
+Для браузерных тестов нужны Node.js 20+ и Chromium:
 
 ```sh
 go build -o bin/backend .
@@ -149,8 +320,38 @@ npm ci
 npx playwright install chromium
 npm run test:syntax
 npm run test:browser
-# Or use an existing Chrome installation:
+```
+
+Вместо браузера Playwright можно указать установленный Chrome:
+
+```sh
 CHROME_BIN=/path/to/chrome npm run test:browser
 ```
 
-Set `UI_SCREENSHOT_DIR=/tmp/warehouse-screenshots` to capture desktop and mobile screenshots during the browser tests. The tests cover protected login, empty state, explicit demo import, demand results, search/supplier filters, product explanations, planning parameters, CSV downloads, inventory/shipments, mobile overflow, import revision conflicts, and HTML escaping. Go tests also verify public static assets, security headers, and API authentication boundaries.
+Браузерные тесты запускают отдельный сервер с временным складом. Они проверяют вход, демо, импорт, фильтры, объяснения, настройки, экспорт, конфликты ревизий и мобильное отображение. Для сохранения скриншотов задайте `UI_SCREENSHOT_DIR=/tmp/warehouse-screenshots`.
+
+После конвертации предоставленных книг можно дополнительно проверить реальный набор:
+
+```sh
+SUPPLIER_IMPORT_FILE="$PWD/data/supplier-import.json" \
+  go test ./internal/planning -run TestActualSupplierImport -v
+
+SUPPLIER_IMPORT_FILE="$PWD/data/supplier-import.json" \
+  npm run test:browser
+```
+
+## Ограничения и частые вопросы
+
+- **Один процесс на файл данных.** Хранилище не имеет межпроцессных блокировок, истории изменений или репликации. Для нескольких экземпляров сервиса потребуется другое хранилище. Запись использует синхронизацию файла, но не каталога после переименования; это ограничивает гарантии при внезапном отключении питания.
+- **Смена даты не восстанавливает прошлый склад.** Остатки и открытые поставки должны соответствовать выбранной дате. При приёмке товара одним импортом увеличьте остаток и уменьшите или удалите поставку, чтобы не учесть её дважды.
+- **Прогноз основан на прозрачных правилах.** Он не моделирует акции, изменения цен, дни отсутствия товара, начало продаж нового товара или недельную сезонность. Повторяющиеся проектные продажи могут изменить медиану; известные исключения отмечайте вручную.
+- **Сезонность задаётся на уровне поставщика.** Применение профилей из исходных книг к количеству продаж каждого товара — допущение расчёта. Суммарные графики могут объединять разные единицы измерения; закупка рассчитывается по каждому товару отдельно.
+- **`/readyz` не проверяет диск постоянно.** Он отражает успешный запуск и чтение снимка. Ошибки последующей записи возвращаются через API и попадают в JSON-логи.
+
+| Ситуация | Действие |
+| --- | --- |
+| После импорта Excel нет готовых заказов | Проверить сроки поставщиков и причины во вкладке «Требуют внимания» |
+| API возвращает `412` | Заново получить снимок, учесть изменения и отправить его с новым `ETag` |
+| После перезагрузки страницы снова нужен ключ | Повторно ввести `API_KEY`: интерфейс не сохраняет его между загрузками |
+| Не находится Excel-файл | Проверить `--source`, каталоги `IEK/` и `systemElectric/`; каждому шаблону конвертера должна соответствовать ровно одна книга |
+| Изменения интерфейса не видны | Пересобрать и перезапустить Go-бинарник или Docker-образ |
