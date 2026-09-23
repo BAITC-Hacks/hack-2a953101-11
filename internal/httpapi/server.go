@@ -18,6 +18,7 @@ import (
 
 	"github.com/electrokomplekt/replenishment/internal/planning"
 	"github.com/electrokomplekt/replenishment/internal/storage"
+	"github.com/electrokomplekt/replenishment/internal/webui"
 )
 
 const maxBodyBytes = 8 << 20
@@ -32,6 +33,7 @@ type API struct {
 func New(store *storage.Store, logger *slog.Logger, apiKey, allowedOrigin string) http.Handler {
 	a := &API{store: store, logger: logger, apiKey: apiKey, origin: allowedOrigin}
 	mux := http.NewServeMux()
+	webui.Register(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ready"}) })
 	mux.HandleFunc("GET /api/v1/dataset", a.getDataset)
@@ -239,7 +241,7 @@ func (a *API) middleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if a.apiKey != "" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+		if a.apiKey != "" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !webui.IsPublic(r.URL.Path) {
 			expected := sha256.Sum256([]byte("Bearer " + a.apiKey))
 			actual := sha256.Sum256([]byte(r.Header.Get("Authorization")))
 			if subtle.ConstantTimeCompare(actual[:], expected[:]) != 1 {

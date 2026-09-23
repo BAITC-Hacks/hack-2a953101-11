@@ -1,6 +1,6 @@
-# Warehouse replenishment backend
+# Warehouse replenishment
 
-Go backend for Электрокомплект: import sales, stock, suppliers, and open shipments; calculate proposed purchase orders grouped by supplier; remove exceptional sales spikes from regular demand; export orders to CSV for Excel.
+Go application with a Russian-language purchasing dashboard for Электрокомплект: import sales, stock, suppliers, and open shipments; calculate proposed purchase orders grouped by supplier; remove exceptional sales spikes from regular demand; export orders to CSV for Excel.
 
 ## Run locally
 
@@ -9,6 +9,19 @@ Requires Go 1.23+; there are no external Go dependencies. Use a supported Go rel
 ```sh
 go run .
 ```
+
+Open **http://127.0.0.1:8080** for the dashboard. The HTML, CSS, and JavaScript are embedded in the Go binary; no frontend build or Node server is needed. The same UI is included in the Docker image.
+
+### Dashboard workflow
+
+- On an empty warehouse, choose **Попробовать демо** and confirm to load a six-product demo with 30 days of sales and three spikes. The demo is stored only after confirmation; it is never loaded automatically.
+- Choose **Загрузить данные** to import a JSON dataset. Review the record counts and confirm replacement. Existing data can be downloaded as a backup before replacement. Imports also accept the GET dataset response wrapper.
+- Adjust the planning date, sales window, review period, and safety days under **Параметры расчёта**. Stock must describe the warehouse on the selected date.
+- Filter recommendations by supplier, name, SKU, or attention status. The arrow on each product opens its calculation, spike adjustments, and warnings. **Товары и остатки** shows all products; **Товары в пути** shows open/overdue shipments.
+- **Экспорт CSV** downloads all current recommended order lines, regardless of table filters, with a UTF-8 BOM for Excel. An export is rejected if the warehouse changed since the displayed calculation.
+- If `API_KEY` is configured, the page remains public but warehouse data requires the key. Use **Подключение** to enter it; the key stays in tab memory, never local/session storage, and must be re-entered after reload.
+
+Charts sum quantities across product base units for an overview; procurement calculations still run separately for each product. The dashboard is responsive, supports keyboard navigation and reduced motion, and uses local assets without external fonts or scripts.
 
 The API listens on `http://127.0.0.1:8080` and persists data to `data/warehouse.json`. In a separate terminal, load the example into a **new** instance (revision 0):
 
@@ -73,7 +86,7 @@ Stock and shipments must describe the warehouse at `as_of`; selecting an earlier
 | `API_KEY` | empty | Bearer token; required for non-loopback binding, minimum 24 characters |
 | `CORS_ORIGIN` | empty | One exact allowed browser origin, e.g. `http://localhost:3000` |
 
-When `API_KEY` is set, send `Authorization: Bearer <API_KEY>` with every `/api/v1/` request. Keep this shared operator credential on trusted clients or a frontend server; there are no per-user roles. CORS exposes `ETag` and `X-Dataset-Revision` for browser clients.
+When `API_KEY` is set, send `Authorization: Bearer <API_KEY>` with every `/api/v1/` request. Share this operator credential only with trusted operators; there are no per-user roles. The bundled dashboard adds the header after the operator enters the key. CORS exposes `ETag` and `X-Dataset-Revision` for separately hosted browser clients; the bundled UI uses the same origin.
 
 ```sh
 export API_KEY="$(openssl rand -hex 32)"
@@ -99,3 +112,17 @@ golangci-lint run
 ```
 
 Tests cover spike filtering, sparse/zero demand, explicit exclusions, date boundaries, incoming/overdue stock, reservation and pack rounding, supplier grouping, validation, cancellation, persistence/restart, concurrent revision conflicts, failed writes, API authentication/import/export, request limits, CORS, and spreadsheet injection. No external services are needed.
+
+Browser tests are optional development tooling (Node 20+). They start a separate backend with a temporary data file, exercise the real UI/API, and leave existing warehouse data untouched:
+
+```sh
+go build -o bin/backend .
+npm ci
+npx playwright install chromium
+npm run test:syntax
+npm run test:browser
+# Or use an existing Chrome installation:
+CHROME_BIN=/path/to/chrome npm run test:browser
+```
+
+Set `UI_SCREENSHOT_DIR=/tmp/warehouse-screenshots` to capture desktop and mobile screenshots during the browser tests. The tests cover protected login, empty state, explicit demo import, demand results, search/supplier filters, product explanations, planning parameters, CSV downloads, inventory/shipments, mobile overflow, import revision conflicts, and HTML escaping. Go tests also verify public static assets, security headers, and API authentication boundaries.
