@@ -338,7 +338,13 @@
         </footer>
       </main>
     </div>
-    <input type="file" id="file-input" accept=".json,application/json" hidden />
+    <input
+      type="file"
+      id="file-input"
+      accept=".json,.xlsx,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      multiple
+      hidden
+    />
     <dialog id="modal" aria-labelledby="modal-title">
       <div class="modal-header">
         <h2 id="modal-title"></h2>

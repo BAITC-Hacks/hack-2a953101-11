@@ -76,6 +76,8 @@ const warningLabels = {
     "Есть риск дефицита до поступления нового заказа",
 };
 let toastTimer;
+let importRequest = 0;
+let xlsxImport = null;
 const mobileLayout = window.matchMedia("(max-width: 680px)");
 
 function syncSidebar() {
@@ -112,15 +114,19 @@ function showError(error) {
 }
 
 async function api(path, options = {}) {
-  const headers = new Headers(options.headers);
+  const { timeout = 30000, signal, ...requestOptions } = options;
+  const headers = new Headers(requestOptions.headers);
   if (state.key) headers.set("Authorization", `Bearer ${state.key}`);
-  if (options.body) headers.set("Content-Type", "application/json");
+  if (requestOptions.body && !(requestOptions.body instanceof FormData))
+    headers.set("Content-Type", "application/json");
   let response;
   try {
     response = await fetch(`/api/v1/${path}`, {
-      ...options,
+      ...requestOptions,
       headers,
-      signal: AbortSignal.timeout(30000),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeout)])
+        : AbortSignal.timeout(timeout),
     });
   } catch {
     throw new Error(
@@ -563,12 +569,24 @@ function render() {
   busy(state.busy);
 }
 
-function openModal(title, body) {
+function resetImport() {
+  importRequest += 1;
+  if (xlsxImport?.converting) {
+    xlsxImport.controller.abort();
+    busy(false);
+  }
+  xlsxImport = null;
+  state.pendingImport = null;
+}
+
+function openModal(title, body, preserveImport = false) {
+  if (!preserveImport) resetImport();
   $("#modal-title").textContent = title;
   $("#modal-body").innerHTML = body;
   if (!$("#modal").open) $("#modal").showModal();
 }
 function closeModal() {
+  resetImport();
   $("#modal").close();
 }
 function modalError(error) {
@@ -581,6 +599,8 @@ function modalError(error) {
     $("#modal-body").append(el);
   }
   el.textContent = error.message;
+  el.tabIndex = -1;
+  el.focus();
 }
 
 function settings() {
@@ -758,6 +778,79 @@ function demoDataset() {
   return data;
 }
 
+function xlsxImportForm() {
+  if (!xlsxImport) return;
+  const { files, asOf, historyStart } = xlsxImport;
+  state.pendingImport = null;
+  openModal(
+    "Загрузка файлов Excel",
+    `<p class="modal-copy">Добавьте полный комплект из шести отчётов для ИЭК, Systeme Electric или обоих поставщиков. Можно выбирать файлы по очереди из разных папок, сохраняя исходные имена.</p><p class="notice">Для каждого поставщика нужны дневные продажи, месячные продажи, месячные остатки, товары в пути, минимальная партия или кратность заказа и сезонность. Файл минимальной партии ИЭК добавьте отдельно, если он лежит вне папки поставщика.</p><form id="xlsx-import-form"><div class="import-files-heading"><strong>Выбрано файлов: ${files.length} из 12</strong><button class="button secondary" type="button" data-action="add-import-files">${icon("upload")}Добавить файлы</button></div><ul class="import-files" id="xlsx-file-list">${files.length ? files.map((file, index) => `<li><span><strong>${escapeHTML(file.name)}</strong><small>${number(file.size / 1024 / 1024)} МБ</small></span><button class="icon-button" type="button" data-remove-import-file="${index}" aria-label="Удалить ${escapeHTML(file.name)}">${icon("close")}</button></li>`).join("") : '<li class="muted">Добавьте отчёты в формате .xlsx.</li>'}</ul><p class="import-size muted">Общий размер: ${number(files.reduce((sum, file) => sum + file.size, 0) / 1024 / 1024)} МБ из 64 МБ</p><div class="form-grid"><label class="field">Дата выгрузки<input name="as_of" type="date" value="${escapeHTML(asOf)}" min="1900-01-01" max="9990-12-31" required><small>Дата, на которую собраны отчёты. Должна совпадать с датой в именах файлов.</small></label><label class="field">Начало истории продаж<input name="history_start" type="date" value="${escapeHTML(historyStart)}" min="1900-01-01" max="${escapeHTML(asOf || "9990-12-31")}" required><small>Первый день полного периода выгрузки, включая дни без продаж.</small></label></div><p class="modal-copy import-help">После проверки вы увидите состав данных и предупреждения. Сохранение потребует отдельного подтверждения. Резервную копию JSON можно загрузить одним файлом.</p><p id="xlsx-import-status" class="import-progress" role="status" hidden><span class="spinner"></span>Читаем отчёты и проверяем данные…</p><div class="modal-actions"><button class="button secondary" type="button" data-action="close-modal">Отмена</button><button class="button primary" id="convert-xlsx" type="submit" ${files.length ? "" : "disabled"}>Проверить файлы</button></div></form>`,
+    true,
+  );
+}
+
+function rememberXlsxDates() {
+  const form = $("#xlsx-import-form");
+  if (!xlsxImport || !form) return;
+  const fields = new FormData(form);
+  xlsxImport.asOf = fields.get("as_of");
+  xlsxImport.historyStart = fields.get("history_start");
+}
+
+async function convertXlsx(form) {
+  if (state.busy || !xlsxImport || !form.reportValidity()) return;
+  rememberXlsxDates();
+  const current = xlsxImport;
+  if (!current.files.length) {
+    modalError(new Error("Добавьте отчёты в формате .xlsx."));
+    return;
+  }
+  if (current.historyStart > current.asOf) {
+    modalError(new Error("Начало истории не может быть позже даты выгрузки."));
+    return;
+  }
+  const body = new FormData();
+  current.files.forEach((file) => body.append("files", file));
+  body.append("as_of", current.asOf);
+  body.append("history_start", current.historyStart);
+  current.controller = new AbortController();
+  current.converting = true;
+  busy(true);
+  $("#modal-error")?.remove();
+  form.setAttribute("aria-busy", "true");
+  form
+    .querySelectorAll("input, button:not([data-action='close-modal'])")
+    .forEach((el) => {
+      el.disabled = true;
+    });
+  $("#xlsx-import-status").hidden = false;
+  try {
+    const response = await api("import/xlsx", {
+      method: "POST",
+      body,
+      timeout: 120000,
+      signal: current.controller.signal,
+    });
+    const converted = await response.json();
+    if (xlsxImport !== current || !$("#modal").open) return;
+    importPreview(converted.data, `Excel · ${current.files.length} файлов`);
+  } catch (error) {
+    if (xlsxImport === current && $("#modal").open) modalError(error);
+  } finally {
+    if (xlsxImport === current) {
+      current.converting = false;
+      busy(false);
+      if ($("#xlsx-import-form") === form) {
+        form.setAttribute("aria-busy", "false");
+        form.querySelectorAll("input, button").forEach((el) => {
+          el.disabled = false;
+        });
+        $("#xlsx-import-status").hidden = true;
+      }
+    }
+  }
+}
+
 function importPreview(data, name, demo = false) {
   if (
     !data ||
@@ -768,6 +861,7 @@ function importPreview(data, name, demo = false) {
     throw new Error(
       "Файл должен содержать массивы suppliers, products, sales, stock и shipments.",
     );
+  if (demo) resetImport();
   state.pendingImport = { data, etag: state.etag, demo };
   openModal(
     demo ? "Попробуйте на примере склада" : "Проверка перед загрузкой",
@@ -782,7 +876,8 @@ function importPreview(data, name, demo = false) {
       )
       .join(
         "",
-      )}</div><p class="notice">${state.snapshot?.data.products.length ? "Загрузка полностью заменит текущие данные склада. Сначала сохраните резервную копию, если хотите вернуться к ним." : "Данные будут сохранены в рабочее пространство. Рекомендации не отправляются поставщикам автоматически."}</p><div class="modal-actions">${state.snapshot?.revision ? '<button class="button secondary" data-action="backup">Скачать текущие данные</button>' : ""}<button class="button primary" id="confirm-import" data-action="confirm-import">${demo ? "Загрузить демоданные" : "Заменить данные"}</button></div>`,
+      )}</div>${data.source?.warnings?.length ? `<div class="notice import-warnings"><strong>Проверка источников</strong><ul>${data.source.warnings.map((warning) => `<li>${escapeHTML(warning)}</li>`).join("")}</ul></div>` : ""}<p class="notice">${state.snapshot?.data.products.length ? "Загрузка полностью заменит текущие данные склада. Сначала сохраните резервную копию, если хотите вернуться к ним." : "Данные будут сохранены в рабочее пространство. Рекомендации не отправляются поставщикам автоматически."}</p><div class="modal-actions">${xlsxImport ? '<button class="button secondary" data-action="back-import-files">Назад к файлам</button>' : ""}${state.snapshot?.revision ? '<button class="button secondary" data-action="backup">Скачать текущие данные</button>' : ""}<button class="button primary" id="confirm-import" data-action="confirm-import">${demo ? "Загрузить демоданные" : "Заменить данные"}</button></div>`,
+    true,
   );
 }
 
@@ -905,6 +1000,13 @@ document.addEventListener("click", async (event) => {
     showDetail(detail.dataset.detail);
     return;
   }
+  const removeFile = event.target.closest("[data-remove-import-file]");
+  if (removeFile && xlsxImport && !state.busy) {
+    rememberXlsxDates();
+    xlsxImport.files.splice(Number(removeFile.dataset.removeImportFile), 1);
+    xlsxImportForm();
+    return;
+  }
   const action = event.target.closest("[data-action]")?.dataset.action;
   if (!action) return;
   try {
@@ -929,11 +1031,17 @@ document.addEventListener("click", async (event) => {
     if (action === "calculate") await calculate();
     if (action === "export") await exportCSV();
     if (action === "confirm-import") await confirmImport();
+    if (action === "add-import-files" && !state.busy) {
+      rememberXlsxDates();
+      $("#file-input").click();
+    }
+    if (action === "back-import-files" && !state.busy) xlsxImportForm();
     if (action === "import") {
       if (!state.snapshot) {
         connect();
         return;
       }
+      resetImport();
       $("#file-input").click();
     }
     if (action === "demo" && state.snapshot)
@@ -954,6 +1062,7 @@ document.addEventListener("click", async (event) => {
 document.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
+  if (form.id === "xlsx-import-form") await convertXlsx(form);
   if (form.id === "settings-form") {
     if (state.busy) return;
     const data = new FormData(form);
@@ -1040,26 +1149,86 @@ document.addEventListener("submit", async (event) => {
 });
 
 $("#file-input").addEventListener("change", async (event) => {
-  const file = event.target.files[0];
+  const selected = [...event.target.files];
   event.target.value = "";
-  if (!file) return;
+  if (!selected.length || state.busy) return;
   try {
+    clearError();
+    if (selected.some((file) => !/\.(json|xlsx)$/i.test(file.name)))
+      throw new Error("Выберите файл JSON или отчёты Excel в формате .xlsx.");
+    const jsonFiles = selected.filter((file) => /\.json$/i.test(file.name));
+    if (jsonFiles.length && (selected.length !== 1 || xlsxImport))
+      throw new Error(
+        "JSON загружается одним файлом, отдельно от Excel. Закройте это окно и начните новую загрузку для выбора JSON.",
+      );
+    if (!jsonFiles.length) {
+      const files = [...(xlsxImport?.files || [])];
+      for (const file of selected) {
+        const existing = files.find((item) => item.name === file.name);
+        if (existing) {
+          if (
+            existing.size === file.size &&
+            existing.lastModified === file.lastModified
+          )
+            continue;
+          throw new Error(
+            `Файл «${file.name}» уже добавлен. Удалите прежний файл перед заменой.`,
+          );
+        }
+        files.push(file);
+      }
+      if (files.length > 12)
+        throw new Error(
+          "Можно загрузить до 12 файлов Excel: по шесть для каждого поставщика.",
+        );
+      if (files.reduce((sum, file) => sum + file.size, 0) > 64 * 1024 * 1024)
+        throw new Error(
+          "Общий размер файлов превышает 64 МБ. Сократите период истории в исходных отчётах.",
+        );
+      if (!xlsxImport) {
+        resetImport();
+        const asOf = shiftDate(state.params.as_of, -1);
+        xlsxImport = {
+          files,
+          asOf,
+          historyStart: `${String(Number(asOf.slice(0, 4)) - 1).padStart(4, "0")}-01-01`,
+          converting: false,
+        };
+      } else {
+        rememberXlsxDates();
+        xlsxImport.files = files;
+      }
+      xlsxImportForm();
+      return;
+    }
+    const file = jsonFiles[0];
     if (file.size > 64 * 1024 * 1024)
       throw new Error(
         "Размер файла превышает 64 МБ. Сократите период истории или число записей.",
       );
+    resetImport();
+    const request = importRequest;
     let data;
     try {
       data = JSON.parse(await file.text());
     } catch {
+      if (request !== importRequest) return;
       throw new Error("Не удалось прочитать JSON. Проверьте формат файла.");
     }
+    if (request !== importRequest) return;
     importPreview(
-      data.data && Array.isArray(data.data.products) ? data.data : data,
+      data?.data && Array.isArray(data.data.products) ? data.data : data,
       file.name,
     );
   } catch (error) {
-    showError(error);
+    if ($("#modal").open) modalError(error);
+    else showError(error);
+  }
+});
+document.addEventListener("input", (event) => {
+  if (event.target.matches("#xlsx-import-form input[name='as_of']")) {
+    $("#xlsx-import-form input[name='history_start']").max =
+      event.target.value || "9990-12-31";
   }
 });
 $("#search").addEventListener("input", (event) => {
@@ -1080,7 +1249,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 $("#modal").addEventListener("close", () => {
-  state.pendingImport = null;
+  if (!$("#modal").open) resetImport();
 });
 let resizeFrame;
 window.addEventListener("resize", () => {

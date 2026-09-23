@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { chromium } from "playwright";
 
 // Runs against its own backend process and temporary warehouse, never user data.
-test("purchasing dashboard end-to-end", { timeout: 90000 }, async (t) => {
+test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "warehouse-ui-test-"));
   const key = "browser-test-key-at-least-24-characters";
   const server = spawn(resolve("bin/backend"), [], {
@@ -265,6 +265,200 @@ test("purchasing dashboard end-to-end", { timeout: 90000 }, async (t) => {
         .waitFor();
       assert.equal(await page.locator("img").count(), 0);
       assert.equal((await snapshot()).data.revision, 3);
+      assert.deepEqual(errors, [], "browser errors or CSP violations");
+    },
+  );
+  await t.test(
+    "Excel selection rejects mixed formats and invalid workbooks without saving",
+    async () => {
+      const initial = await snapshot();
+      const invalidWorkbook = {
+        name: "unsupported.xlsx",
+        mimeType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        buffer: Buffer.from("This is not an Excel workbook."),
+      };
+      const input = page.locator("#file-input");
+      assert.match(await input.getAttribute("accept"), /\.json/);
+      assert.match(await input.getAttribute("accept"), /\.xlsx/);
+      assert.equal(await input.getAttribute("multiple"), "");
+      await input.setInputFiles([
+        {
+          name: "warehouse.json",
+          mimeType: "application/json",
+          buffer: Buffer.from(JSON.stringify(initial.data.data)),
+        },
+        invalidWorkbook,
+      ]);
+      await page.locator("#error-banner").waitFor({ state: "visible" });
+      assert.equal(await page.locator("#modal").isVisible(), false);
+      assert.equal((await snapshot()).data.revision, initial.data.revision);
+
+      await input.setInputFiles(invalidWorkbook);
+      await page.locator("#xlsx-import-form").waitFor();
+      await page.locator("#xlsx-import-form [name='as_of']").fill("2026-09-22");
+      await page
+        .locator("#xlsx-import-form [name='history_start']")
+        .fill("2025-01-01");
+      await page.locator("#convert-xlsx").click();
+      await page.locator("#modal-error").waitFor({ state: "visible" });
+      assert.equal(await page.locator("#confirm-import").count(), 0);
+      assert.deepEqual(
+        await snapshot(),
+        initial,
+        "failed conversion must not save",
+      );
+      await page
+        .locator("#modal")
+        .getByRole("button", { name: "Закрыть", exact: true })
+        .click();
+    },
+  );
+  await t.test(
+    "cancelled Excel conversion cannot replace a newer file selection",
+    async () => {
+      const initial = await snapshot();
+      let reply;
+      let replied;
+      const releaseResponse = new Promise((resolveResponse) => {
+        reply = resolveResponse;
+      });
+      const responseFinished = new Promise((resolveResponse) => {
+        replied = resolveResponse;
+      });
+      const url = "**/api/v1/import/xlsx";
+      await page.route(url, async (route) => {
+        await releaseResponse;
+        try {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ data: initial.data.data }),
+          });
+        } finally {
+          replied();
+        }
+      });
+      try {
+        const workbook = (name) => ({
+          name,
+          mimeType:
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          buffer: Buffer.from(
+            "Conversion response is controlled by this test.",
+          ),
+        });
+        await page.locator("#file-input").setInputFiles(workbook("first.xlsx"));
+        await page.locator("#xlsx-import-form").waitFor();
+        const request = page.waitForRequest("**/api/v1/import/xlsx");
+        await page.locator("#convert-xlsx").click();
+        await request;
+        await page
+          .locator("#modal")
+          .getByRole("button", { name: "Закрыть", exact: true })
+          .click();
+        await page
+          .locator("#file-input")
+          .setInputFiles(workbook("second.xlsx"));
+        await page.locator("#xlsx-import-form").waitFor();
+        reply();
+        await responseFinished;
+        assert.equal(await page.locator("#confirm-import").count(), 0);
+        assert.equal(
+          await page.locator("#xlsx-file-list strong").innerText(),
+          "second.xlsx",
+        );
+        assert.equal(await page.locator("#convert-xlsx").isEnabled(), true);
+        assert.deepEqual(await snapshot(), initial);
+        await page
+          .locator("#modal")
+          .getByRole("button", { name: "Закрыть", exact: true })
+          .click();
+      } finally {
+        reply();
+        await page.unroute(url);
+      }
+    },
+  );
+  await t.test(
+    "original Excel batches accumulate, preview safely and restore a JSON backup",
+    { skip: !process.env.SUPPLIER_WORKBOOK_DIR, timeout: 120000 },
+    async () => {
+      const root = resolve(process.env.SUPPLIER_WORKBOOK_DIR);
+      const workbookPaths = async (directory) =>
+        (await readdir(directory))
+          .filter((name) => name.endsWith(".xlsx") && !name.startsWith("~$"))
+          .sort()
+          .map((name) => join(directory, name));
+      const iek = await workbookPaths(join(root, "IEK"));
+      const systeme = await workbookPaths(join(root, "systemElectric"));
+      const moq = join(root, "MOQ  ИЭК.xlsx");
+      assert.equal(iek.length + systeme.length + 1, 12);
+      const initial = await snapshot();
+      const input = page.locator("#file-input");
+      const removeButtons = page.locator(
+        "#xlsx-file-list [data-remove-import-file]",
+      );
+
+      await input.setInputFiles(iek);
+      await page.locator("#xlsx-import-form").waitFor();
+      assert.equal(await removeButtons.count(), iek.length);
+      const chooser = page.waitForEvent("filechooser");
+      await page.locator("[data-action='add-import-files']").click();
+      await (await chooser).setFiles(systeme);
+      assert.equal(await removeButtons.count(), iek.length + systeme.length);
+      await input.setInputFiles(moq);
+      assert.equal(await removeButtons.count(), 12);
+      await removeButtons.first().click();
+      assert.equal(await removeButtons.count(), 11);
+      await input.setInputFiles(iek[0]);
+      assert.equal(await removeButtons.count(), 12);
+      await page.locator("#xlsx-import-form [name='as_of']").fill("2026-09-22");
+      await page
+        .locator("#xlsx-import-form [name='history_start']")
+        .fill("2025-01-01");
+      await page.locator("#convert-xlsx").click();
+      await page.locator("#confirm-import").waitFor({ timeout: 90000 });
+      assert.deepEqual(
+        await snapshot(),
+        initial,
+        "Excel preview must not save",
+      );
+      const counts = await page
+        .locator("#modal .import-summary strong")
+        .allTextContents();
+      assert.deepEqual(
+        counts.map((value) => Number(value.replace(/\D/g, ""))),
+        [3909, 140922, 313],
+      );
+      await page.locator("#confirm-import").click();
+      await page.locator("#modal").waitFor({ state: "hidden", timeout: 30000 });
+      await loaded();
+      const imported = await snapshot();
+      assert.equal(imported.data.revision, initial.data.revision + 1);
+      assert.equal(imported.data.data.products.length, 3909);
+      assert.equal(imported.data.data.sales.length, 140922);
+      assert.equal(imported.data.data.shipments.length, 313);
+      await page
+        .locator("#source-notice")
+        .getByText("IEK / Systeme Electric · Алматы", { exact: true })
+        .waitFor();
+      assert.equal(await page.locator("table tbody tr").count(), 100);
+      assert.equal(await page.locator("#export-button").isDisabled(), true);
+
+      await input.setInputFiles({
+        name: "warehouse-backup.json",
+        mimeType: "application/json",
+        buffer: Buffer.from(JSON.stringify(initial.data)),
+      });
+      await page.locator("#confirm-import").waitFor();
+      assert.equal((await snapshot()).data.revision, imported.data.revision);
+      await page.locator("#confirm-import").click();
+      await page.locator("#modal").waitFor({ state: "hidden" });
+      await loaded();
+      const restored = await snapshot();
+      assert.deepEqual(restored.data.data, initial.data.data);
+      assert.equal(restored.data.revision, imported.data.revision + 1);
       assert.deepEqual(errors, [], "browser errors or CSP violations");
     },
   );
