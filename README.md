@@ -17,7 +17,7 @@ Open **http://127.0.0.1:8080** for the dashboard. The HTML, CSS, and JavaScript 
 - On an empty warehouse, choose **Попробовать демо** and confirm to load a six-product demo with 30 days of sales and three spikes. The demo is stored only after confirmation; it is never loaded automatically.
 - Choose **Загрузить данные** to import a JSON dataset. Review the record counts and confirm replacement. Existing data can be downloaded as a backup before replacement. Imports also accept the GET dataset response wrapper.
 - Adjust the planning date, sales window, review period, and safety days under **Параметры расчёта**. Stock must describe the warehouse on the selected date.
-- Filter recommendations by supplier, name, SKU, or attention status. The arrow on each product opens its calculation, spike adjustments, and warnings. **Товары и остатки** shows all products; **Товары в пути** shows open/overdue shipments.
+- Filter recommendations by supplier, name, supplier SKU, 1C code, or attention status. Catalogues are paginated at 100 products per page. The arrow on each product opens its calculation, spike adjustments, and warnings. **Товары и остатки** shows all products; **Товары в пути** shows open/overdue shipments.
 - **Экспорт CSV** downloads all current recommended order lines, regardless of table filters, with a UTF-8 BOM for Excel. An export is rejected if the warehouse changed since the displayed calculation.
 - If `API_KEY` is configured, the page remains public but warehouse data requires the key. Use **Подключение** to enter it; the key stays in tab memory, never local/session storage, and must be re-entered after reload.
 
@@ -42,7 +42,7 @@ Expected demo: cable demand drops from approximately 88.57 to 20 units/day after
 
 ## API
 
-All API responses and imports use JSON except CSV exports. Dates use `YYYY-MM-DD`; quantities are nonnegative integers in each product's base unit (use a smaller unit for fractional goods). Application errors use `{"error":{"code":"...","message":"..."}}`; unmatched routes and unsupported methods use standard HTTP 404/405 responses.
+All API responses and imports use JSON except CSV exports. Dates use `YYYY-MM-DD`; quantities are numeric values in each product's base unit, including fractional metres; sales may be signed net quantities to preserve returns/corrections. Application errors use `{"error":{"code":"...","message":"..."}}`; unmatched routes and unsupported methods use standard HTTP 404/405 responses.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -53,7 +53,7 @@ All API responses and imports use JSON except CSV exports. Dates use `YYYY-MM-DD
 | POST | `/api/v1/recommendations` | Supplier orders and explanations for every product |
 | POST | `/api/v1/recommendations.csv` | Same calculation exported as supplier order lines |
 
-PUT accepts the dataset itself, as in `examples/dataset.json`, rather than the GET response wrapper. All five arrays are required; use `[]` for empty collections. A missing stock row is rejected rather than treated as an empty warehouse. Each product belongs to one supplier. Each product/date pair must have one aggregated sales row; duplicated daily rows, unknown references, negative quantities, invalid dates, and reserved quantities above stock are rejected. `pack_size` is required and positive; `min_order_quantity` defaults to zero. Import limit: 8 MiB. This is a full replacement, so fetch, edit, and submit the complete snapshot when changing one record.
+PUT accepts the dataset itself, as in `examples/dataset.json`, rather than the GET response wrapper. All five arrays are required; use `[]` for empty collections. A missing stock row is rejected rather than treated as an empty warehouse. Each product belongs to one supplier. Each product/date pair must have one aggregated sales row; duplicated daily rows, unknown references, negative stock/shipments, invalid dates, and reserved quantities above stock are rejected. `pack_size` is required and positive; `min_order_quantity` defaults to zero. Import limit: 64 MiB. This is a full replacement, so fetch, edit, and submit the complete snapshot when changing one record.
 
 POST accepts `{}` for defaults: today's UTC date, 90 history days, 14 review days, 7 safety days. Override with:
 
@@ -65,17 +65,45 @@ Lookback: 7–730 days; review: 1–365 days; safety: 0–365 days; supplier lea
 
 ## Calculation rules
 
-1. Use complete calendar days in `[as_of - lookback_days, as_of)`. Missing sales days count as zero; today's partial sales and future sales are ignored.
+1. Use complete calendar days in `[as_of - lookback_days, as_of)`, intersected with `source.history_start`/`source.history_end` when supplied. Missing sales days **within that known coverage** count as zero; unknown days outside it are excluded from the denominator. Today's partial sales and future sales are ignored. Negative daily net sales are retained in raw demand but contribute zero to replenishment demand, with an explicit `net_returns` adjustment.
 2. Explicitly marked `exclude_from_demand: true` sales contribute zero to regular demand. They remain visible in raw demand and the adjustment audit.
 3. With at least four positive, unexcluded days, calculate their median and median absolute deviation (MAD). A daily quantity strictly above `max(3 × median, median + 3 × 1.4826 × MAD)` is replaced with the median. This removes the exceptional portion while retaining normal daily demand. With fewer observations, retain sales and return `insufficient_positive_days_for_spike_detection`.
-4. Divide adjusted sales by all lookback days, including zeros. Coverage is supplier lead time + review period + safety days. Target stock is `ceil(adjusted sales × coverage / lookback)`.
+4. Divide adjusted sales by observed calendar days, including zeros. Coverage is supplier lead time + review period + safety days. With a supplied 12-month supplier profile, de-seasonalize each adjusted historical day, then apply each future day's monthly factor across the coverage horizon. `daily_demand` remains historical regular demand; `forecast_daily_demand` and `seasonal_factor` explain the projected demand. Target stock is the ceiling of projected coverage demand. Without a profile, the original average-demand calculation applies.
 5. Available stock is `on_hand - reserved`. Count open shipments due between `as_of` and `as_of + coverage` inclusive. Overdue shipments are excluded and flagged; later shipments do not cover this order horizon.
 6. Net requirement is `max(0, target - available - incoming)`. A positive requirement is raised to the product minimum and rounded up to a full pack. No minimum is applied when the requirement is zero.
-7. Group positive lines by supplier. Proposed arrival is `as_of + lead_time_days`. `insufficient_supply_during_lead_time` warns when available stock plus incoming supply due by that date cannot cover average lead-time demand.
+7. Stock older than the day before `as_of` (or dated in the future), explicitly unverified stock, unconfirmed lead times, missing history, and product `review_reasons` block export. A blocked line exposes a provisional `suggested_quantity` but has `order_quantity: 0`. Group only positive, unblocked lines by supplier. Proposed arrival is `as_of + lead_time_days`. `insufficient_supply_during_lead_time` warns when available stock plus incoming supply due by that date cannot cover forecast average lead-time demand.
 
-These are transparent planning heuristics, not a seasonal forecast. The operator must supply a complete sales window; missing records mean zero sales, not unavailable history. Stockouts, new-product launch dates, price changes, weekday patterns, and promotions are not modeled. Repeated project sales can dominate the median; use manual exclusion when business context identifies them. The lead-time warning is an aggregate check and cannot identify every temporary shortage before individual shipments arrive.
+These are transparent planning heuristics with optional supplier-level monthly seasonality. Complete source-history boundaries must be supplied accurately. Daily stockouts, new-product launch dates, price changes, weekday patterns, and promotions are not modeled; monthly opening balances cannot establish exact days of availability. Repeated project sales can dominate the median; use manual exclusion when business context identifies them. The lead-time warning is an aggregate check and cannot identify every temporary shortage before individual shipments arrive.
 
 Stock and shipments must describe the warehouse at `as_of`; selecting an earlier date does not reconstruct historical stock. Shipments represent only remaining, unreceived quantities. Upon receipt, update stock and remove/reduce that shipment in one snapshot import to avoid double counting. Recommendations are proposals; generating/exporting one neither sends it to a supplier nor records a new shipment.
+
+
+## Supplied IEK and Systeme Electric workbooks
+
+All 12 source workbooks (14 sheets), including the IEK MOQ workbook at the repository root, were reviewed. See [the source review](docs/SUPPLIER_DATA_REVIEW.md) for mappings, discrepancies, and known limitations.
+
+Prepare an import and detailed audit without modifying the live warehouse:
+
+```sh
+python3 scripts/import_supplier_workbooks.py
+```
+
+This writes `data/supplier-import.json` (about 15 MB) and `data/supplier-import-report.json`. In the dashboard choose **Загрузить данные**, select `supplier-import.json`, review the preview, and confirm. The planning date becomes 23 September 2026, following the supplied snapshot/history date of 22 September. The data-quality banner and **Требуют внимания** view show blocked items; these are not exported as orders.
+
+Standard lead times are absent from the workbooks. Enter confirmed values in **Параметры расчёта**; changes persist with the same revision checks as imports. Alternatively, pass explicitly confirmed values with `--iek-lead-days` and `--systeme-lead-days` when running the converter. They default to **unconfirmed**, not an assumed same-day delivery.
+
+IEK September stock is an opening balance dated **1 September**, so it cannot authorize orders on 23 September. Update the dataset with an actual current-stock export (`on_hand`, `reserved`, `as_of`) before clearing that block. For products with unresolved `review_reasons`, correct the article/order rules/unit conversion against the source and remove the resolved reasons in the JSON before importing. `pack_size` and `min_order_quantity` are expressed in the same base unit as stock and demand; do not combine reel counts with metres without a confirmed conversion.
+
+The converter uses the Python standard library, streams worksheet XML, reads cached formula values without executing formulas, preserves leading zeros in 1C codes, and checks workbook snapshot dates. It reconciles monthly totals but does **not** add them to transaction totals. Full source documents and generated warehouse data are excluded from Docker builds. No workbook or existing live snapshot is rewritten.
+
+```sh
+python3 -m unittest discover -s scripts -p 'test_*.py'
+SUPPLIER_IMPORT_FILE="$PWD/data/supplier-import.json" go test ./internal/planning -run TestActualSupplierImport -v
+# Include the actual import in isolated browser tests:
+SUPPLIER_IMPORT_FILE="$PWD/data/supplier-import.json" CHROME_BIN=/path/to/chrome npm run test:browser
+```
+
+The extended JSON model adds `supplier.seasonality` (12 positive monthly factors), `lead_time_unconfirmed`, product `internal_code`, `unit`, and `review_reasons`, stock `as_of`/`unverified`, and a `source` object with label, snapshot date, history boundaries, and audit warnings. Older datasets without these optional fields retain their original behavior. CSV export appends 1C code, unit, forecast demand, and seasonal factor.
 
 ## Configuration and deployment
 

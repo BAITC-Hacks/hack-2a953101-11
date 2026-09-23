@@ -55,7 +55,14 @@ func Open(path string) (*Store, error) {
 
 func clone(d planning.Dataset) planning.Dataset {
 	d.Suppliers = append([]planning.Supplier{}, d.Suppliers...)
+	for i := range d.Suppliers {
+		d.Suppliers[i].Seasonality = append([]float64(nil), d.Suppliers[i].Seasonality...)
+	}
 	d.Products = append([]planning.Product{}, d.Products...)
+	for i := range d.Products {
+		d.Products[i].ReviewReasons = append([]string(nil), d.Products[i].ReviewReasons...)
+	}
+	d.Source.Warnings = append([]string(nil), d.Source.Warnings...)
 	d.Sales = append([]planning.Sale{}, d.Sales...)
 	d.Stock = append([]planning.Stock{}, d.Stock...)
 	d.Shipments = append([]planning.Shipment{}, d.Shipments...)

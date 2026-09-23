@@ -21,7 +21,7 @@ import (
 	"github.com/electrokomplekt/replenishment/internal/webui"
 )
 
-const maxBodyBytes = 8 << 20
+const maxBodyBytes = 64 << 20
 
 type API struct {
 	store  *storage.Store
@@ -84,7 +84,7 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			problem(w, 413, "body_too_large", "request body exceeds 8 MiB")
+			problem(w, 413, "body_too_large", "request body exceeds 64 MiB")
 		} else {
 			problem(w, 400, "invalid_json", err.Error())
 		}
@@ -158,11 +158,11 @@ func (a *API) recommend(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(r.URL.Path, ".csv") {
 		var body bytes.Buffer
 		writer := csv.NewWriter(&body)
-		_ = writer.Write([]string{"supplier_id", "supplier_name", "product_id", "sku", "product_name", "quantity", "expected_date", "daily_demand", "available_stock", "incoming_quantity"})
+		_ = writer.Write([]string{"supplier_id", "supplier_name", "product_id", "sku", "product_name", "quantity", "expected_date", "daily_demand", "available_stock", "incoming_quantity", "internal_code", "unit", "forecast_daily_demand", "seasonal_factor"})
 		for _, order := range result.Orders {
 			for _, line := range order.Lines {
 				_ = writer.Write([]string{safeCell(order.SupplierID), safeCell(order.SupplierName), safeCell(line.ProductID), safeCell(line.SKU), safeCell(line.Name),
-					strconv.FormatInt(line.OrderQuantity, 10), order.ExpectedDate, strconv.FormatFloat(line.DailyDemand, 'f', 6, 64), strconv.FormatInt(line.AvailableStock, 10), strconv.FormatInt(line.IncomingQuantity, 10)})
+					strconv.FormatFloat(line.OrderQuantity, 'f', -1, 64), order.ExpectedDate, strconv.FormatFloat(line.DailyDemand, 'f', 6, 64), strconv.FormatFloat(line.AvailableStock, 'f', -1, 64), strconv.FormatFloat(line.IncomingQuantity, 'f', -1, 64), safeCell(line.InternalCode), safeCell(line.Unit), strconv.FormatFloat(line.ForecastDemand, 'f', 6, 64), strconv.FormatFloat(line.SeasonalFactor, 'f', 6, 64)})
 			}
 		}
 		writer.Flush()

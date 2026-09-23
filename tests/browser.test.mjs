@@ -268,4 +268,76 @@ test("purchasing dashboard end-to-end", { timeout: 90000 }, async (t) => {
       assert.deepEqual(errors, [], "browser errors or CSP violations");
     },
   );
+  await t.test(
+    "supplied supplier workbook import and safe ordering",
+    { skip: !process.env.SUPPLIER_IMPORT_FILE },
+    async () => {
+      page.setDefaultTimeout(30000);
+      await page
+        .locator("#file-input")
+        .setInputFiles(process.env.SUPPLIER_IMPORT_FILE);
+      await page
+        .getByRole("button", { name: "Заменить данные", exact: true })
+        .click();
+      await page.locator("#modal").waitFor({ state: "hidden" });
+      await loaded();
+      await page
+        .locator("#source-notice")
+        .getByText("IEK / Systeme Electric · Алматы", { exact: true })
+        .waitFor();
+      assert.equal(await page.locator("table tbody tr").count(), 100);
+      assert.equal(await page.locator("#export-button").isDisabled(), true);
+      await page.getByLabel("Поиск товаров").fill("130200015_");
+      assert.equal(await page.locator("table tbody tr").count(), 1);
+      await page
+        .getByRole("button", { name: "Расчёт для", exact: false })
+        .click();
+      await page
+        .locator("#modal")
+        .getByText("43,2 / 0", { exact: true })
+        .waitFor();
+      await page.getByRole("button", { name: "Готово", exact: true }).click();
+      await page.getByLabel("Поиск товаров").fill("");
+      const firstPage = await page
+        .locator("table tbody tr")
+        .first()
+        .innerText();
+      await page.locator("[data-action='next-page']").click();
+      assert.notEqual(
+        await page.locator("table tbody tr").first().innerText(),
+        firstPage,
+      );
+      await page
+        .getByRole("button", { name: "Параметры расчёта", exact: true })
+        .click();
+      await page.locator("input[name='lead-0']").fill("14");
+      await page.locator("input[name='lead-1']").fill("7");
+      await page
+        .getByRole("button", { name: "Применить и рассчитать" })
+        .click();
+      await page.locator("#modal").waitFor({ state: "hidden" });
+      await loaded();
+      assert.equal(await page.locator("#export-button").isDisabled(), false);
+      const planning = await api("recommendations", {
+        method: "POST",
+        body: JSON.stringify({
+          as_of: "2026-09-23",
+          lookback_days: 90,
+          review_period_days: 7,
+          safety_stock_days: 7,
+        }),
+      });
+      const result = await planning.json();
+      assert.ok(result.orders.length > 0);
+      assert.ok(
+        result.orders.every((order) => order.supplier_id === "systeme"),
+      );
+      assert.ok(
+        result.products.some(
+          (p) => p.blocked && p.warnings.includes("stock_snapshot_outdated"),
+        ),
+      );
+      assert.deepEqual(errors, []);
+    },
+  );
 });
