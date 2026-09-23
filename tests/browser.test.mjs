@@ -324,11 +324,10 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
   );
 
   await t.test(
-    "inventory, shipments, mobile navigation and no overflow",
+    "all products in recommendations, shipments, mobile navigation and no overflow",
     async () => {
-      await page
-        .getByRole("button", { name: "Товары и остатки", exact: true })
-        .click();
+      await page.locator("[data-view='orders']").click();
+      await page.getByRole("button", { name: "Все товары", exact: true }).click();
       assert.equal(await page.locator("table tbody tr").count(), 6);
       await page
         .getByRole("button", { name: "Товары в пути", exact: true })
