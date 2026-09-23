@@ -872,6 +872,15 @@ td:first-child,
 th:first-child {
   padding-left: 23px;
 }
+.explanation-row td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.explanation-text {
+  /* Keep expanded text out of the table's intrinsic column sizing. */
+  contain: inline-size;
+  margin: 0;
+}
 .product-cell {
   display: flex;
   align-items: center;

@@ -252,7 +252,7 @@ function renderStats() {
     {
       label: "Всплесков исключено",
       value: spikes,
-      unit: "дней",
+      unit: "корректировок",
       caption: "Учитываем регулярную потребность",
       icon: "spark",
       color: "green",
@@ -477,7 +477,7 @@ function renderTable() {
   }
   $("#table-content").innerHTML =
     `<div class="table-scroll"><table><thead><tr><th scope="col">Товар / Артикул</th><th scope="col">Поставщик</th><th scope="col">Прогноз спроса</th><th scope="col">Доступно</th><th scope="col">В пути</th><th scope="col">К закупке</th><th scope="col">Статус</th><th scope="col"><span class="muted">Обоснование</span></th></tr></thead><tbody>${lines
-      .map((line) => {
+      .map((line, index) => {
         const risk = line.warnings.includes(
           "insufficient_supply_during_lead_time",
         );
@@ -491,7 +491,7 @@ function renderTable() {
               : line.order_quantity > 0
                 ? ["purple", "К закупке"]
                 : ["green", "Запас в норме"];
-        return `<tr><td><div class="product-cell"><span class="product-icon">${icon("box")}</span><div><div class="product-name">${escapeHTML(line.name)}</div><div class="product-sku">${escapeHTML(line.sku)}${line.internal_code ? ` · 1С: ${escapeHTML(line.internal_code)}` : ""}${line.unit ? ` · ${escapeHTML(line.unit)}` : ""}</div></div></div></td><td>${escapeHTML(supplierMap.get(line.supplier_id))}</td><td class="numeric">${number(line.forecast_demand, 1)}</td><td class="numeric">${number(line.available_stock)}</td><td class="numeric">${number(line.incoming_quantity)}</td><td class="order-quantity numeric">${line.order_quantity ? number(line.order_quantity) : "—"}</td><td><span class="badge ${status[0]}">${status[1]}</span></td><td><details><summary>Обоснование</summary><p>${escapeHTML(line.explanation || "")}</p></details><button class="row-detail" data-detail="${escapeHTML(line.product_id)}" aria-label="Расчёт для ${escapeHTML(line.name)}">${icon("chevron")}</button></td></tr>`;
+        return `<tr><td><div class="product-cell"><span class="product-icon">${icon("box")}</span><div><div class="product-name">${escapeHTML(line.name)}</div><div class="product-sku">${escapeHTML(line.sku)}${line.internal_code ? ` · 1С: ${escapeHTML(line.internal_code)}` : ""}${line.unit ? ` · ${escapeHTML(line.unit)}` : ""}</div></div></div></td><td>${escapeHTML(supplierMap.get(line.supplier_id))}</td><td class="numeric">${number(line.forecast_demand, 1)}</td><td class="numeric">${number(line.available_stock)}</td><td class="numeric">${number(line.incoming_quantity)}</td><td class="order-quantity numeric">${line.order_quantity ? number(line.order_quantity) : "—"}</td><td><span class="badge ${status[0]}">${status[1]}</span></td><td><details data-explanation="${escapeHTML(line.product_id)}"><summary aria-controls="explanation-${index}">Обоснование</summary></details><button class="row-detail" data-detail="${escapeHTML(line.product_id)}" aria-label="Расчёт для ${escapeHTML(line.name)}">${icon("chevron")}</button></td></tr>`;
       })
       .join("")}</tbody></table></div>`;
 }
@@ -1069,6 +1069,28 @@ async function exportCSV() {
     busy(false);
   }
 }
+
+document.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (!details.matches("details[data-explanation]") || !details.isConnected)
+    return;
+  const id = details.querySelector("summary").getAttribute("aria-controls");
+  document.getElementById(id)?.remove();
+  if (!details.open) return;
+  const line = state.result?.products.find(
+    (product) => product.product_id === details.dataset.explanation,
+  );
+  const row = document.createElement("tr");
+  row.id = id;
+  row.className = "explanation-row";
+  const cell = row.insertCell();
+  cell.colSpan = details.closest("tr").cells.length;
+  const text = document.createElement("p");
+  text.className = "explanation-text";
+  text.textContent = line?.explanation || "";
+  cell.append(text);
+  details.closest("tr").after(row);
+}, true);
 
 document.addEventListener("click", async (event) => {
   const view = event.target.closest("[data-view]");

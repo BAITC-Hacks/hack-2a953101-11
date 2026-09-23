@@ -86,6 +86,55 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     const res = await api("dataset");
     return { data: await res.json(), etag: res.headers.get("etag") };
   };
+  const tableGeometry = () => page.locator("#table-content").evaluate((root) => {
+    const table = root.querySelector("table");
+    const scroll = root.querySelector(".table-scroll");
+    return {
+      width: table.getBoundingClientRect().width,
+      scrollWidth: scroll.scrollWidth,
+      clientWidth: scroll.clientWidth,
+      rows: [...table.querySelectorAll("tbody tr:not(.explanation-row)")].map(
+        (row) => [...row.cells].map((cell) => {
+          const rect = cell.getBoundingClientRect();
+          return [rect.width, rect.height];
+        }),
+      ),
+    };
+  });
+  const checkExplanation = async (summary, expected, key) => {
+    const before = await tableGeometry();
+    if (key) {
+      await summary.focus();
+      await summary.press(key);
+    } else {
+      await summary.click();
+    }
+    const id = await summary.getAttribute("aria-controls");
+    const row = page.locator(`#${id}`);
+    await row.waitFor({ state: "visible" });
+    assert.equal(await row.locator("p").textContent(), expected);
+    assert.equal(await row.locator("td").getAttribute("colspan"), "8");
+    assert.deepEqual(await tableGeometry(), before, "expansion must preserve table width and ordinary rows");
+    const layout = await row.evaluate((element) => {
+      const text = element.querySelector("p");
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      return {
+        width: element.getBoundingClientRect().width,
+        lines: new Set([...range.getClientRects()].map((rect) => rect.top)).size,
+        textOverflow: text.scrollWidth > text.clientWidth,
+        pageOverflow: document.documentElement.scrollWidth > window.innerWidth,
+      };
+    });
+    assert.equal(layout.width, before.width, "explanation must span the whole table");
+    assert.ok(layout.lines > 1, "explanation must wrap across multiple lines");
+    assert.equal(layout.textOverflow, false, "explanation must not overflow its cell");
+    assert.equal(layout.pageOverflow, false, "explanation must not overflow the page");
+    assert.equal(await row.locator("img").count(), 0, "explanation remains plain text");
+    await summary.press("Space");
+    await row.waitFor({ state: "detached" });
+    assert.deepEqual(await tableGeometry(), before, "collapse restores the table");
+  };
 
   await t.test(
     "public shell, protected data, login and empty state",
@@ -116,6 +165,20 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     },
   );
 
+  await t.test("sidebar profile is static and the connection control still works", async () => {
+    const profile = page.locator(".account");
+    await profile.getByText("Электрокомплект", { exact: true }).click();
+    assert.equal(await page.locator("#modal").isVisible(), false);
+    assert.equal(await profile.evaluate((element) => element.tabIndex), -1);
+    assert.equal(await profile.evaluate((element) => getComputedStyle(element).cursor), "auto");
+    await page.locator(".sidebar-tip button").focus();
+    await page.keyboard.press("Tab");
+    assert.equal(await page.locator(".connection").evaluate((element) => element === document.activeElement), true);
+    await page.locator(".connection").press("Enter");
+    await page.getByRole("heading", { name: "Подключение к складу" }).waitFor();
+    await page.locator("#modal").getByRole("button", { name: "Закрыть", exact: true }).click();
+  });
+
   await t.test(
     "explicit demo import, real demand calculations and charts",
     async () => {
@@ -135,7 +198,7 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
           .nth(2)
           .locator(".stat-number")
           .innerText(),
-        "3дней",
+        "3корректировок",
       );
       assert.equal(await page.locator("#demand-chart svg").count(), 1);
       assert.equal(await page.locator("table tbody tr").count(), 5);
@@ -151,6 +214,55 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       }
     },
   );
+
+  await t.test("inline explanations wrap without adding horizontal overflow", async () => {
+    const initial = await snapshot();
+    const prose = "Регулярный спрос рассчитан по завершённым периодам с учётом запасов и поставок. ".repeat(30);
+    const unbroken = `Артикул-${"АБ123".repeat(800)} <img src=x onerror="alert(1)">`;
+    const url = "**/api/v1/recommendations";
+    let fixture;
+    await page.route(url, async (route) => {
+      const response = await route.fetch();
+      fixture = await response.json();
+      for (const line of fixture.products) {
+        line.explanation = line.product_id === "cable" ? prose : unbroken;
+      }
+      await route.fulfill({ response, json: fixture });
+    });
+    try {
+      await page.locator("#calculate-button").click();
+      await loaded();
+      const summaries = page.locator("#table-content summary");
+      const cable = page.locator("details[data-explanation='cable'] summary");
+      const other = page.locator("details[data-explanation]:not([data-explanation='cable']) summary").first();
+      for (const width of [1920, 1440, 390]) {
+        await page.setViewportSize({ width, height: 1100 });
+        const geometry = await tableGeometry();
+        if (width === 1920) assert.equal(geometry.scrollWidth, geometry.clientWidth, "desktop table fits without a scrollbar");
+        await checkExplanation(cable, prose);
+        await checkExplanation(other, unbroken, "Enter");
+      }
+      await page.setViewportSize({ width: 1440, height: 1100 });
+      await summaries.nth(0).click();
+      await page.locator(".explanation-row").waitFor();
+      await summaries.nth(1).click();
+      await page.waitForFunction(() => document.querySelectorAll(".explanation-row").length === 2);
+      await summaries.nth(0).click();
+      await page.waitForFunction(() => document.querySelectorAll(".explanation-row").length === 1);
+      await page.getByLabel("Поиск товаров").fill("ВВГ");
+      assert.equal(await page.locator(".explanation-row").count(), 0, "filtering removes stale explanations");
+      assert.equal(await page.locator("#table-content details[open]").count(), 0);
+      await checkExplanation(cable, prose);
+      assert.deepEqual(errors, [], "browser errors or CSP violations");
+    } finally {
+      await page.setViewportSize({ width: 1440, height: 1100 });
+      await page.unroute(url);
+      await page.getByLabel("Поиск товаров").fill("");
+      await page.locator("#calculate-button").click();
+      await loaded();
+    }
+    assert.deepEqual(await snapshot(), initial, "expanding explanations must not change warehouse data");
+  });
 
   await t.test(
     "search, supplier filter, details, settings and CSV",
@@ -571,6 +683,14 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       body: JSON.stringify({ as_of: "2026-09-23", lookback_days: 365, review_period_days: 14, safety_stock_days: 7 }),
     });
     const { products } = await recommendations.json();
+    const spikes = products.reduce((sum, product) => sum + product.adjustments.filter((adjustment) => adjustment.reason === "sales_spike").length, 0);
+    const spikeCard = page.locator(".stat-card").filter({ hasText: "Всплесков исключено" });
+    assert.equal(await spikeCard.locator(".stat-number").innerText(), `${new Intl.NumberFormat("ru-RU").format(spikes)}корректировок`);
+    const firstSummary = page.locator("#table-content summary").first();
+    const productID = await firstSummary.locator("..").getAttribute("data-explanation");
+    const product = products.find((line) => line.product_id === productID);
+    assert.ok(product.audit, "use an actual monthly calculation for the regression");
+    await checkExplanation(firstSummary, product.explanation);
     const needed = products.filter((product) => product.order_quantity > 0).length;
     await page.locator(".tab[data-filter='needed']").click();
     assert.equal(Number(await page.locator("#table-count").innerText()), needed);
