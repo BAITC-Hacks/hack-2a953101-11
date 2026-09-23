@@ -407,6 +407,18 @@ function emptyTable() {
   return `<div class="empty-state"><div class="empty-symbol">${icon("check")}</div><h3>${state.filter === "needed" && !state.search && !state.supplier ? "Запасов достаточно" : "Подходящих товаров нет"}</h3><p>${state.filter === "needed" && !state.search && !state.supplier ? "В выбранном горизонте пополнение не требуется. Все товары доступны на вкладке «Все товары»." : "Попробуйте другой поисковый запрос, поставщика или фильтр."}</p></div>`;
 }
 
+function isAttentionWarning(warning) {
+  // The monthly dataset also puts shared source/method notes in warnings.
+  // Ignore only those notes here; keep unknown warnings and any problem text
+  // combined with a note. The original warnings remain in the product details.
+  return warning
+    .replace(/^Использовано полных месяцев: \d+\. Пустые ячейки сводных таблиц приняты за 0; отсутствие строки остатка не считается подтверждённым дефицитом\.$/, "")
+    .replaceAll("Срок новой поставки отсутствует в источниках: принято 14 дней.", "")
+    .replace(/Остаток: месячный срез \d{2}\.\d{2}\.\d{4}, не текущая инвентаризация; проверьте перед заказом\./g, "")
+    .replace(/^Остаток датирован \d{4}-\d{2}-\d{2}; выбранная дата не восстанавливает движение склада\.$/, "")
+    .trim().length > 0;
+}
+
 function renderTable() {
   const supplierMap = new Map(
     (state.snapshot?.data.suppliers || []).map((s) => [s.id, s.name]),
@@ -418,10 +430,16 @@ function renderTable() {
   let lines = state.result?.products || [];
   if (state.filter === "needed")
     lines = lines.filter((line) => line.order_quantity > 0);
-  if (state.filter === "attention")
-    lines = lines.filter(
-      (line) => line.warnings.length > 0 || line.adjustments.length > 0,
+  if (state.filter === "attention") {
+    const products = new Map(
+      (state.snapshot?.data.products || []).map((product) => [product.id, product]),
     );
+    lines = lines.filter(
+      (line) => line.blocked ||
+        products.get(line.product_id)?.review_reasons?.length > 0 ||
+        line.warnings.some(isAttentionWarning) || line.adjustments.length > 0,
+    );
+  }
   lines = lines.filter(
     (line) =>
       (!state.supplier || line.supplier_id === state.supplier) &&

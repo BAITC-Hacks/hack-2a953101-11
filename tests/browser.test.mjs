@@ -562,6 +562,106 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     assert.ok(csv.includes("IVR21-1-25"));
     assert.ok(csv.includes("после компенсации"));
     assert.deepEqual(errors, [], "browser errors or CSP violations");
+
+    await page.getByLabel("Поиск товаров").fill("");
+    await page.locator(".tab[data-filter='all']").click();
+    assert.equal(await page.locator("#table-count").innerText(), "3907");
+    const recommendations = await api("recommendations", {
+      method: "POST",
+      body: JSON.stringify({ as_of: "2026-09-23", lookback_days: 365, review_period_days: 14, safety_stock_days: 7 }),
+    });
+    const { products } = await recommendations.json();
+    const needed = products.filter((product) => product.order_quantity > 0).length;
+    await page.locator(".tab[data-filter='needed']").click();
+    assert.equal(Number(await page.locator("#table-count").innerText()), needed);
+    await page.locator(".tab[data-filter='attention']").click();
+    const attention = Number(await page.locator("#table-count").innerText());
+    assert.ok(attention > 0 && attention < 3907, "shared Excel notes must not put every product in attention");
+    t.diagnostic(`Excel tabs: needed=${needed}, all=3907, attention=${attention}`);
+  });
+
+  await t.test("purchase tabs distinguish orders, problems and healthy stock", async () => {
+    const initial = await snapshot();
+    const response = await api("recommendations", {
+      method: "POST",
+      body: JSON.stringify({ as_of: "2026-09-23", lookback_days: 365, review_period_days: 14, safety_stock_days: 7 }),
+    });
+    const result = await response.json();
+    const cases = [
+      { id: "healthy" },
+      { id: "information", warnings: [
+        "Использовано полных месяцев: 12. Пустые ячейки сводных таблиц приняты за 0; отсутствие строки остатка не считается подтверждённым дефицитом.",
+        "Остаток: месячный срез 01.09.2026, не текущая инвентаризация; проверьте перед заказом. Срок новой поставки отсутствует в источниках: принято 14 дней. ",
+        "Остаток датирован 2026-09-01; выбранная дата не восстанавливает движение склада.",
+      ] },
+      { id: "purchase", order_quantity: 5 },
+      { id: "warning", warnings: ["overdue_shipments_excluded"] },
+      { id: "risk", order_quantity: 2, warnings: ["insufficient_supply_during_lead_time"] },
+      { id: "adjusted", adjustments: [{ date: "2026-08-01", original_quantity: 100, used_quantity: 10, reason: "sales_spike" }] },
+      { id: "blocked", blocked: true },
+      { id: "review", review_reasons: ["missing_order_rules"] },
+      { id: "text-warning", warnings: ["Остаток отсутствует: для предварительного расчёта принят 0, требуется проверка."] },
+      { id: "mixed-warning", warnings: ["Остаток: месячный срез 01.09.2026, не текущая инвентаризация; проверьте перед заказом. MOQ/кратность не подтверждены: расчёт по 1 единице. Срок новой поставки отсутствует в источниках: принято 14 дней."] },
+      { id: "stock-warning", warnings: ["stock_snapshot_outdated"] },
+      { id: "lead-warning", warnings: ["lead_time_unconfirmed"] },
+      { id: "unknown-warning", warnings: ["new_supplier_problem"] },
+    ];
+    const fixture = structuredClone(initial.data);
+    fixture.data.products = cases.map(({ id, review_reasons = [] }) => ({
+      ...initial.data.data.products[0], id, name: id, sku: id, review_reasons,
+    }));
+    fixture.data.stock = cases.map(({ id }) => ({ product_id: id, on_hand: 100, reserved: 0 }));
+    fixture.data.sales = [];
+    fixture.data.monthly = [];
+    fixture.data.shipments = [];
+    const template = result.products[0];
+    result.products = cases.map(({ id, review_reasons, ...changes }) => ({
+      ...template, product_id: id, name: id, sku: id,
+      supplier_id: fixture.data.products[0].supplier_id,
+      order_quantity: 0, blocked: false, warnings: [], adjustments: [],
+      ...changes,
+    }));
+    result.orders = [];
+    const datasetURL = "**/api/v1/dataset";
+    const recommendationsURL = "**/api/v1/recommendations";
+    await page.route(datasetURL, (route) => route.fulfill({ json: fixture, headers: { ETag: initial.etag } }));
+    await page.route(recommendationsURL, (route) => route.fulfill({ json: result }));
+    const visibleIDs = () => page.locator("#table-content [data-detail]").evaluateAll(
+      (buttons) => buttons.map((button) => button.dataset.detail).sort(),
+    );
+    const checkTab = async (filter, expected) => {
+      await page.locator(`.tab[data-filter='${filter}']`).click();
+      assert.deepEqual(await visibleIDs(), [...expected].sort(), filter);
+      assert.equal(await page.locator("#table-count").innerText(), String(expected.length));
+      assert.equal(await page.locator(`.tab[data-filter='${filter}']`).getAttribute("aria-pressed"), "true");
+    };
+    try {
+      await page.getByLabel("Поиск товаров").fill("");
+      await page.getByLabel("Поставщик", { exact: true }).selectOption("");
+      await page.locator("#calculate-button").click();
+      await loaded();
+      await checkTab("needed", ["purchase", "risk"]);
+      await checkTab("all", cases.map(({ id }) => id));
+      assert.equal(await page.locator("#table-content tr").filter({ has: page.locator("[data-detail='healthy']") }).locator(".badge").innerText(), "Запас в норме");
+      await page.locator("[data-detail='information']").click();
+      const details = await page.locator("#modal-body").innerText();
+      for (const note of cases.find(({ id }) => id === "information").warnings) {
+        assert.ok(details.includes(note.trim()), "informational notes remain in product details");
+      }
+      await page.locator("#modal").getByRole("button", { name: "Готово", exact: true }).click();
+      await checkTab("attention", ["warning", "risk", "adjusted", "blocked", "review", "text-warning", "mixed-warning", "stock-warning", "lead-warning", "unknown-warning"]);
+      await page.getByLabel("Поиск товаров").fill("healthy");
+      assert.deepEqual(await visibleIDs(), []);
+      await page.getByLabel("Поиск товаров").fill("");
+      await checkTab("needed", ["purchase", "risk"]);
+      assert.deepEqual(errors, [], "browser errors or CSP violations");
+    } finally {
+      await page.unroute(datasetURL);
+      await page.unroute(recommendationsURL);
+      await page.locator("#calculate-button").click();
+      await loaded();
+    }
+    assert.deepEqual(await snapshot(), initial, "tab filtering must not modify warehouse data");
   });
 
 });
