@@ -443,7 +443,7 @@ function renderTable() {
   lines = lines.filter(
     (line) =>
       (!state.supplier || line.supplier_id === state.supplier) &&
-      `${line.name} ${line.sku} ${line.internal_code || ""}`
+      `${line.name} ${line.sku} ${line.internal_code || line.product_id}`
         .toLocaleLowerCase("ru-RU")
         .includes(state.search),
   );
@@ -507,7 +507,7 @@ function renderShipments(supplierMap) {
       return (
         p &&
         (!state.supplier || p.supplier_id === state.supplier) &&
-        `${p.name} ${p.sku} ${p.internal_code || ""}`
+        `${p.name} ${p.sku} ${p.internal_code || p.id}`
           .toLocaleLowerCase("ru-RU")
           .includes(state.search)
       );

@@ -313,7 +313,7 @@ func TestRealSupplierWorkbooks(t *testing.T) {
 		t.Skip("set SUPPLIER_WORKBOOK_DIR to the directory with IEK, systemElectric, and the root IEK MOQ workbook")
 	}
 	var files []File
-	for _, pattern := range []string{"IEK/*.xlsx", "systemElectric/*.xlsx", "MOQ*.xlsx"} {
+	for _, pattern := range []string{"IEK/*.xlsx", "systemElectric/*.xlsx"} {
 		paths, err := filepath.Glob(filepath.Join(root, pattern))
 		if err != nil {
 			t.Fatal(err)
@@ -325,6 +325,18 @@ func TestRealSupplierWorkbooks(t *testing.T) {
 			}
 			files = append(files, File{Name: filepath.Base(path), Data: data})
 		}
+	}
+	// Older source layouts keep IEK's MOQ only in the root. Do not also add
+	// root copies when the supplier directory already contains the workbook.
+	if _, err := os.Stat(filepath.Join(root, "IEK", "MOQ  ИЭК.xlsx")); os.IsNotExist(err) {
+		name := "MOQ  ИЭК.xlsx"
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, File{Name: name, Data: data})
+	} else if err != nil {
+		t.Fatal(err)
 	}
 	data, err := Import(context.Background(), files, fixtureOptions)
 	if err != nil {

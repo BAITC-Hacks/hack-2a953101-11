@@ -394,6 +394,15 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       assert.match(await input.getAttribute("accept"), /\.json/);
       assert.match(await input.getAttribute("accept"), /\.xlsx/);
       assert.equal(await input.getAttribute("multiple"), "");
+      await input.setInputFiles({
+        name: "legacy.xls",
+        mimeType: "application/vnd.ms-excel",
+        buffer: Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      });
+      await page.locator("#error-banner").waitFor({ state: "visible" });
+      assert.match(await page.locator("#error-banner").innerText(), /формате \.xlsx/);
+      assert.equal(await page.locator("#modal").isVisible(), false);
+      assert.deepEqual(await snapshot(), initial, "unsupported XLS must not save");
       await input.setInputFiles([
         {
           name: "warehouse.json",
@@ -502,7 +511,11 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
           .filter((name) => name.endsWith(".xlsx") && !name.startsWith("~$"))
           .sort()
           .map((name) => join(directory, name));
-      const iek = await workbookPaths(join(root, "IEK"));
+      // Add the root MOQ separately to exercise multi-directory selection,
+      // even when the same workbook is also included in the IEK directory.
+      const iek = (await workbookPaths(join(root, "IEK"))).filter(
+        (path) => path !== join(root, "IEK", "MOQ  ИЭК.xlsx"),
+      );
       const systeme = await workbookPaths(join(root, "systemElectric"));
       const moq = join(root, "MOQ  ИЭК.xlsx");
       assert.equal(iek.length + systeme.length + 1, 12);
@@ -667,6 +680,15 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     await page.locator("#modal").getByRole("button", {name:"Готово",exact:true}).click();
     assert.equal(await page.locator("#table-content tbody tr").count(), 1);
     assert.match(await page.locator("#table-content").innerText(), /IVR21-1-25/);
+    // The embedded snapshot stores the exact 1C code in product_id, while
+    // direct imports also supply internal_code. Both must remain searchable.
+    await page.getByLabel("Поиск товаров").fill("010400929_");
+    assert.equal(await page.locator("#table-count").innerText(), "1");
+    assert.match(await page.locator("#table-content").innerText(), /IVR21-1-25/);
+    await page.locator(".nav-item[data-view='shipments']").click();
+    assert.ok(Number(await page.locator("#table-count").innerText()) > 0);
+    assert.match(await page.locator("#table-content").innerText(), /IVR21-1-25/);
+    await page.locator(".nav-item[data-view='overview']").click();
     const downloadPromise = page.waitForEvent("download");
     await page.locator("#export-button").click();
     const download = await downloadPromise;

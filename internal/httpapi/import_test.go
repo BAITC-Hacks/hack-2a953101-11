@@ -63,6 +63,7 @@ func TestExcelUploadErrorsDoNotModifyData(t *testing.T) {
 		{"missing files", dates, 400},
 		{"missing dates", []uploadPart{{"files", "broken.xlsx", "not a zip"}}, 400},
 		{"JSON cannot be mixed", append(append([]uploadPart{}, dates...), uploadPart{"files", "data.json", sample}), 400},
+		{"legacy XLS is unsupported", append(append([]uploadPart{}, dates...), uploadPart{"files", "legacy.xls", "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"}), 400},
 		{"unexpected file field", append(append([]uploadPart{}, dates...), uploadPart{"other", "broken.xlsx", "not a zip"}), 400},
 		{"duplicate date", append(append([]uploadPart{}, dates...), dates[0]), 400},
 		{"unknown field", []uploadPart{{field: "typo", value: "2025-01-01"}}, 400},
