@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import test from "node:test";
 import { chromium } from "playwright";
 
@@ -134,6 +134,35 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     await summary.press("Space");
     await row.waitFor({ state: "detached" });
     assert.deepEqual(await tableGeometry(), before, "collapse restores the table");
+  };
+  const supplierWorkbooks = async () => {
+    const root = resolve(process.env.SUPPLIER_WORKBOOK_DIR);
+    const workbookPaths = async (directory) =>
+      (await readdir(directory))
+        .filter((name) => name.endsWith(".xlsx") && !name.startsWith("~$"))
+        .sort()
+        .map((name) => join(directory, name));
+    const iek = await workbookPaths(join(root, "IEK"));
+    const systeme = await workbookPaths(join(root, "systemElectric"));
+    // Prefer the separate MOQ when present to exercise multi-directory selection.
+    const rootMOQ = join(root, "MOQ  ИЭК.xlsx");
+    const moq = (await workbookPaths(root)).includes(rootMOQ)
+      ? rootMOQ
+      : join(root, "IEK", "MOQ  ИЭК.xlsx");
+    const iekReports = iek.filter((path) => basename(path) !== "MOQ  ИЭК.xlsx");
+    assert.equal(iekReports.length + 1, 6);
+    assert.equal(systeme.length, 6);
+    return { iek: [...iekReports, moq], systeme };
+  };
+  const selectWorkbooks = async (files) => {
+    await page.locator("#file-input").setInputFiles(files);
+    await page.locator("#xlsx-import-form").waitFor();
+    assert.equal(
+      await page.locator(".import-files-heading strong").innerText(),
+      `Выбрано файлов: ${files.length}`,
+    );
+    await page.locator("#xlsx-import-form [name='as_of']").fill("2026-09-22");
+    await page.locator("#xlsx-import-form [name='history_start']").fill("2025-01-01");
   };
 
   await t.test(
@@ -423,6 +452,11 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
         .fill("2025-01-01");
       await page.locator("#convert-xlsx").click();
       await page.locator("#modal-error").waitFor({ state: "visible" });
+      assert.match(await page.locator("#modal-error").innerText(), /[А-Яа-яЁё]/);
+      assert.doesNotMatch(
+        await page.locator("#modal-error").innerText(),
+        /unrecognized supplier|unsupported workbook|missing required workbooks/i,
+      );
       assert.equal(await page.locator("#confirm-import").count(), 0);
       assert.deepEqual(
         await snapshot(),
@@ -501,23 +535,108 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       }
     },
   );
+  for (const scenario of [
+    { supplier: "iek", name: "IEK" },
+    { supplier: "systeme", name: "Systeme Electric" },
+    { supplier: "systeme", name: "Systeme Electric with a generic daily-sales filename", genericDailyName: true },
+  ]) {
+    await t.test(
+      `complete ${scenario.name} Excel set is accepted without the other supplier`,
+      { skip: !process.env.SUPPLIER_WORKBOOK_DIR, timeout: 90000 },
+      async () => {
+        const initial = await snapshot();
+        const batches = await supplierWorkbooks();
+        let files = batches[scenario.supplier];
+        if (scenario.genericDailyName) {
+          files = await Promise.all(files.map(async (path) => ({
+            name: basename(path).startsWith("Динамика продаж")
+              ? "Динамика продаж_2025-2026.xlsx"
+              : basename(path),
+            mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            buffer: await readFile(path),
+          })));
+        }
+        let attemptedSave = false;
+        try {
+          await selectWorkbooks(files);
+          const responsePromise = page.waitForResponse("**/api/v1/import/xlsx", { timeout: 90000 });
+          await page.locator("#convert-xlsx").click();
+          const response = await responsePromise;
+          assert.equal(response.status(), 200);
+          await page.locator("#confirm-import").waitFor();
+          assert.deepEqual(await snapshot(), initial, "supplier preview must not save");
+          attemptedSave = true;
+          await page.locator("#confirm-import").click();
+          await page.locator("#modal").waitFor({ state: "hidden", timeout: 30000 });
+          await loaded();
+          // Read the saved data directly; large Excel responses can exceed Chrome's inspector cache.
+          const imported = await snapshot();
+          assert.equal(imported.data.revision, initial.data.revision + 1);
+          assert.deepEqual(imported.data.data.suppliers.map((supplier) => supplier.id), [scenario.supplier]);
+          assert.ok(imported.data.data.products.length > 0);
+          assert.ok(imported.data.data.products.every((product) => product.supplier_id === scenario.supplier));
+        } finally {
+          if (await page.locator("#modal").isVisible()) {
+            await page.locator("#modal").getByRole("button", { name: "Закрыть", exact: true }).click();
+          }
+          if (attemptedSave) {
+            await loaded();
+            await page.locator("#file-input").setInputFiles({
+              name: "warehouse-backup.json",
+              mimeType: "application/json",
+              buffer: Buffer.from(JSON.stringify(initial.data)),
+            });
+            await page.locator("#confirm-import").waitFor();
+            await page.locator("#confirm-import").click();
+            await page.locator("#modal").waitFor({ state: "hidden" });
+            await loaded();
+            assert.deepEqual((await snapshot()).data.data, initial.data.data);
+          }
+        }
+      },
+    );
+  }
+  await t.test(
+    "incomplete Excel sets list missing files in Russian only for affected suppliers",
+    { skip: !process.env.SUPPLIER_WORKBOOK_DIR, timeout: 90000 },
+    async () => {
+      const initial = await snapshot();
+      const batches = await supplierWorkbooks();
+      const incomplete = (files) => files.filter((path) => !basename(path).startsWith("Сезонность"));
+      for (const scenario of [
+        { files: incomplete(batches.iek), affected: ["IEK"], absent: /Systeme Electric/ },
+        { files: incomplete(batches.systeme), affected: ["Systeme Electric"], absent: /IEK|ИЭК/ },
+        { files: [...incomplete(batches.iek), ...incomplete(batches.systeme)], affected: ["IEK", "Systeme Electric"] },
+        { files: [...batches.iek, ...incomplete(batches.systeme)], affected: ["Systeme Electric"], absent: /IEK|ИЭК/ },
+      ]) {
+        try {
+          await selectWorkbooks(scenario.files);
+          await page.locator("#convert-xlsx").click();
+          await page.locator("#modal-error").waitFor({ state: "visible", timeout: 90000 });
+          const message = await page.locator("#modal-error").innerText();
+          for (const supplier of scenario.affected) {
+            assert.ok(message.includes(`${supplier}: не хватает файлов: Сезонность`), message);
+          }
+          if (scenario.absent) assert.doesNotMatch(message, scenario.absent);
+          assert.doesNotMatch(message, /missing required workbooks|select all six|monthly_sales|transactions/i);
+          assert.equal(await page.locator("#confirm-import").count(), 0);
+          assert.deepEqual(await snapshot(), initial, "incomplete supplier set must not save");
+        } finally {
+          if (await page.locator("#modal").isVisible()) {
+            await page.locator("#modal").getByRole("button", { name: "Закрыть", exact: true }).click();
+          }
+        }
+      }
+    },
+  );
   await t.test(
     "original Excel batches accumulate, preview safely and restore a JSON backup",
     { skip: !process.env.SUPPLIER_WORKBOOK_DIR, timeout: 120000 },
     async () => {
-      const root = resolve(process.env.SUPPLIER_WORKBOOK_DIR);
-      const workbookPaths = async (directory) =>
-        (await readdir(directory))
-          .filter((name) => name.endsWith(".xlsx") && !name.startsWith("~$"))
-          .sort()
-          .map((name) => join(directory, name));
-      // Add the root MOQ separately to exercise multi-directory selection,
-      // even when the same workbook is also included in the IEK directory.
-      const iek = (await workbookPaths(join(root, "IEK"))).filter(
-        (path) => path !== join(root, "IEK", "MOQ  ИЭК.xlsx"),
-      );
-      const systeme = await workbookPaths(join(root, "systemElectric"));
-      const moq = join(root, "MOQ  ИЭК.xlsx");
+      const batches = await supplierWorkbooks();
+      const iek = batches.iek.slice(0, -1);
+      const moq = batches.iek.at(-1);
+      const systeme = batches.systeme;
       assert.equal(iek.length + systeme.length + 1, 12);
       const initial = await snapshot();
       const input = page.locator("#file-input");
@@ -538,6 +657,7 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       assert.equal(await removeButtons.count(), 11);
       await input.setInputFiles(iek[0]);
       assert.equal(await removeButtons.count(), 12);
+      assert.equal(await page.locator(".import-files-heading strong").innerText(), "Выбрано файлов: 12");
       await page.locator("#xlsx-import-form [name='as_of']").fill("2026-09-22");
       await page
         .locator("#xlsx-import-form [name='history_start']")
@@ -561,6 +681,7 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       await loaded();
       const imported = await snapshot();
       assert.equal(imported.data.revision, initial.data.revision + 1);
+      assert.deepEqual(imported.data.data.suppliers.map((supplier) => supplier.id).sort(), ["iek", "systeme"]);
       assert.equal(imported.data.data.products.length, 3909);
       assert.equal(imported.data.data.sales.length, 140922);
       assert.equal(imported.data.data.shipments.length, 313);

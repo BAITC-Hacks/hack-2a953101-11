@@ -121,6 +121,85 @@ func TestExcelUploadBodyLimitAndBusy(t *testing.T) {
 	}
 }
 
+func TestExcelUploadValidationMessagesAreRussian(t *testing.T) {
+	h := testAPI(t, "secret")
+	headers := map[string]string{"Authorization": "Bearer secret", "If-Match": `"0"`}
+	if w := request(h, "PUT", "/api/v1/dataset", sample, headers); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	before := request(h, "GET", "/api/v1/dataset", "", headers).Body.String()
+	dates := []uploadPart{{field: "as_of", value: "2026-09-22"}, {field: "history_start", value: "2025-01-01"}}
+	t.Run("corrupt known workbooks hide parser errors", func(t *testing.T) {
+		files, err := filepath.Glob("../workbook/testdata/iek/*.xlsx")
+		if err != nil || len(files) != 6 {
+			t.Fatalf("six Excel fixtures required: %v %v", files, err)
+		}
+		parts := append([]uploadPart{}, dates...)
+		for _, file := range files {
+			parts = append(parts, uploadPart{"files", filepath.Base(file), "not a zip"})
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, uploadRequest(t, parts))
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("corrupt upload: %d %s", w.Code, w.Body.String())
+		}
+		var response struct {
+			Error struct{ Message string } `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		want := "Не удалось прочитать Excel-файлы: файл повреждён или структура листов и колонок не поддерживается. Проверьте файлы и повторите загрузку."
+		if response.Error.Message != want {
+			t.Fatalf("unexpected public parser error: %q", response.Error.Message)
+		}
+	})
+	for _, tc := range []struct {
+		name, file, supplier, otherSupplier string
+	}{
+		{"incomplete IEK", "../workbook/testdata/iek/Ежемесячные остатки ИЭК.xlsx", "IEK", "Systeme Electric"},
+		{"incomplete Systeme Electric", "../../systemElectric/Ежемесячные остатки SystemElectric 2024-2026.xlsx", "Systeme Electric", "IEK"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := os.ReadFile(tc.file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts := append(append([]uploadPart{}, dates...), uploadPart{"files", filepath.Base(tc.file), string(data)})
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, uploadRequest(t, parts))
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("incomplete upload: %d %s", w.Code, w.Body.String())
+			}
+			var response struct {
+				Error struct{ Message string } `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			message := response.Error.Message
+			if !strings.Contains(message, tc.supplier) || strings.Contains(message, tc.otherSupplier) || strings.Contains(message, "missing required workbooks") {
+				t.Fatalf("unexpected supplier validation message: %q", message)
+			}
+			for _, missing := range []string{"Ежемесячные продажи", "Динамика продаж", "Сезонность", "MOQ"} {
+				if !strings.Contains(message, missing) {
+					t.Errorf("missing workbook %q absent from public message: %q", missing, message)
+				}
+			}
+			if !strings.Contains(strings.ToLower(message), "путь") && !strings.Contains(strings.ToLower(message), "пути") {
+				t.Errorf("missing incoming workbook absent from public message: %q", message)
+			}
+			if strings.Contains(message, "Ежемесячные остатки") {
+				t.Errorf("uploaded workbook reported missing: %q", message)
+			}
+		})
+	}
+	after := request(h, "GET", "/api/v1/dataset", "", headers)
+	if after.Body.String() != before || after.Header().Get("ETag") != `"1"` {
+		t.Fatal("failed upload changed stored snapshot")
+	}
+}
+
 func TestExcelPreviewAndConfirmedImport(t *testing.T) {
 	h := testAPI(t, "secret")
 	files, err := filepath.Glob("../workbook/testdata/iek/*.xlsx")

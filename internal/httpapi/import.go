@@ -97,15 +97,22 @@ func (a *API) importXLSX(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	data, err := workbook.Import(ctx, files, workbook.Options{AsOf: fields["as_of"], HistoryStart: fields["history_start"]})
 	if err != nil {
+		a.logger.Warn("import Excel workbooks", "error", err)
 		if ctx.Err() != nil {
 			problem(w, 408, "import_timeout", "Время обработки Excel истекло. Повторите загрузку отдельно для каждого поставщика.")
 		} else {
-			problem(w, 422, "invalid_workbook", err.Error())
+			message := "Не удалось прочитать Excel-файлы: файл повреждён или структура листов и колонок не поддерживается. Проверьте файлы и повторите загрузку."
+			var validation *workbook.ValidationError
+			if errors.As(err, &validation) {
+				message = validation.Message
+			}
+			problem(w, 422, "invalid_workbook", message)
 		}
 		return
 	}
 	if err := data.Validate(); err != nil {
-		problem(w, 422, "invalid_dataset", err.Error())
+		a.logger.Warn("validate imported Excel dataset", "error", err)
+		problem(w, 422, "invalid_dataset", "Данные в Excel-файлах не прошли проверку. Проверьте значения и связи товаров в комплекте поставщика.")
 		return
 	}
 	// Do not preview a dataset that the regular JSON save endpoint cannot accept.

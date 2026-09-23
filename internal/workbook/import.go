@@ -1,10 +1,10 @@
 package workbook
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
-	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -40,40 +40,6 @@ var kindLabels = map[string]string{
 }
 var months = map[string]int{"янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
 
-func classify(name string) (supplier, kind string, err error) {
-	name = strings.ToLower(path.Base(strings.ReplaceAll(name, "\\", "/")))
-	if !strings.HasSuffix(name, ".xlsx") || strings.HasPrefix(name, "~$") {
-		return "", "", fmt.Errorf("expected an .xlsx supplier workbook")
-	}
-	switch {
-	case strings.Contains(name, "system") || strings.Contains(name, "syseme"):
-		supplier = "systeme"
-	case strings.Contains(name, "иэк") || strings.Contains(name, "iek"):
-		supplier = "iek"
-	case name == "динамика продаж_2025-2026.xlsx" || name == "ежемесячные продажи в количественном выражении за последние 2 года.xlsx":
-		supplier = "iek"
-	default:
-		return "", "", fmt.Errorf("unrecognized supplier filename; use the original IEK or Systeme Electric workbook names")
-	}
-	switch {
-	case strings.HasPrefix(name, "ежемесячные остатки"):
-		kind = "stock"
-	case strings.HasPrefix(name, "ежемесячные продажи"):
-		kind = "monthly_sales"
-	case strings.HasPrefix(name, "динамика продаж"):
-		kind = "transactions"
-	case strings.HasPrefix(name, "сезонность"):
-		kind = "seasonality"
-	case strings.HasPrefix(name, "moq"):
-		kind = "moq"
-	case strings.HasPrefix(name, "путь") || strings.HasPrefix(name, "товар в пути"):
-		kind = "incoming"
-	default:
-		return "", "", fmt.Errorf("unsupported workbook type")
-	}
-	return supplier, kind, nil
-}
-
 // Import converts a complete six-workbook export for one or both suppliers. It
 // returns a preview and never changes persisted data. Input order is irrelevant.
 func Import(ctx context.Context, files []File, options Options) (planning.Dataset, error) {
@@ -82,36 +48,88 @@ func Import(ctx context.Context, files []File, options Options) (planning.Datase
 	}
 	for _, date := range []string{options.AsOf, options.HistoryStart} {
 		if _, err := planning.ParseDate(date); err != nil {
-			return planning.Dataset{}, fmt.Errorf("as_of and history_start are required YYYY-MM-DD dates: %w", err)
+			return planning.Dataset{}, validationError("Укажите дату выгрузки и начало истории в формате ГГГГ-ММ-ДД.")
 		}
 	}
 	if options.HistoryStart > options.AsOf {
-		return planning.Dataset{}, fmt.Errorf("history_start must not be after as_of")
+		return planning.Dataset{}, validationError("Начало истории не может быть позже даты выгрузки.")
 	}
 	if len(files) == 0 || len(files) > 12 {
-		return planning.Dataset{}, fmt.Errorf("select six workbooks per supplier (6 or 12 files)")
+		return planning.Dataset{}, validationError("Выберите от 1 до 12 файлов Excel: полный комплект содержит шесть отчётов одного поставщика.")
 	}
-	groups := map[string]map[string]File{}
+	type classifiedFile struct {
+		File
+		book *book
+		kind string
+	}
+	groups := map[string]map[string]classifiedFile{}
+	var pending []classifiedFile
+	add := func(supplier string, file classifiedFile) error {
+		if groups[supplier] == nil {
+			groups[supplier] = map[string]classifiedFile{}
+		}
+		if previous, exists := groups[supplier][file.kind]; exists {
+			return validationError("%s: повторяется отчёт «%s»: «%s» и «%s». Оставьте один файл этого типа.", supplierNames[supplier], kindLabels[file.kind], previous.Name, file.Name)
+		}
+		groups[supplier][file.kind] = file
+		return nil
+	}
+	limits := &budget{}
 	var compressed int64
 	for _, file := range files {
 		compressed += int64(len(file.Data))
 		if compressed > 64<<20 {
-			return planning.Dataset{}, fmt.Errorf("uploaded workbooks exceed 64 MiB")
+			return planning.Dataset{}, validationError("Общий размер файлов превышает 64 МиБ.")
 		}
-		supplier, kind, err := classify(file.Name)
+		hint, err := filenameSupplier(file.Name)
+		if err != nil {
+			return planning.Dataset{}, err
+		}
+		b, err := openBook(ctx, file.Data, limits)
 		if err != nil {
 			return planning.Dataset{}, fmt.Errorf("%s: %w", file.Name, err)
 		}
-		if groups[supplier] == nil {
-			groups[supplier] = map[string]File{}
+		supplier, kind, err := classifyBook(b)
+		if err != nil {
+			return planning.Dataset{}, fmt.Errorf("%s: %w", file.Name, err)
 		}
-		if previous, exists := groups[supplier][kind]; exists {
-			return planning.Dataset{}, fmt.Errorf("duplicate %s %s workbooks: %s and %s", supplier, kindLabels[kind], previous.Name, file.Name)
+		if supplier != "" && hint != "" && supplier != hint {
+			return planning.Dataset{}, validationError("Файл «%s»: структура соответствует %s, а имя указывает на %s. Проверьте файл и уточните поставщика в его имени.", file.Name, supplierNames[supplier], supplierNames[hint])
 		}
-		groups[supplier][kind] = file
+		if supplier == "" {
+			supplier = hint
+		}
+		entry := classifiedFile{File: file, book: b, kind: kind}
+		if supplier == "" {
+			pending = append(pending, entry)
+		} else if err := add(supplier, entry); err != nil {
+			return planning.Dataset{}, err
+		}
 	}
-	imp := importer{ctx: ctx, options: options, data: planning.EmptyDataset(), products: map[string]*planning.Product{}, stock: map[string]planning.Stock{}, sales: map[saleKey]float64{}, monthly: map[saleKey]float64{}, monthlyDaily: map[saleKey]float64{}, articles: map[string]string{}, orderRules: map[string]bool{}}
-	limits := &budget{}
+	// Shared layouts are assigned only when the detected supplier and missing
+	// report type make the assignment unique. Never default an unknown file to IEK.
+	for _, file := range pending {
+		var candidates []string
+		for _, supplier := range []string{"iek", "systeme"} {
+			if group := groups[supplier]; group != nil {
+				if _, exists := group[file.kind]; !exists || len(groups) == 1 {
+					candidates = append(candidates, supplier)
+				}
+			}
+		}
+		if len(candidates) != 1 {
+			return planning.Dataset{}, validationError("Не удалось однозначно определить поставщика файла «%s» (%s). Укажите IEK или Systeme Electric в имени этого файла и повторите проверку.", file.Name, kindLabels[file.kind])
+		}
+		for supplier, group := range groups {
+			if previous, exists := group[file.kind]; exists && supplier != candidates[0] && bytes.Equal(previous.Data, file.Data) {
+				return planning.Dataset{}, validationError("Файл «%s» совпадает с уже добавленным отчётом «%s». Проверьте комплект и укажите поставщика в имени файла, если это отдельный отчёт.", file.Name, previous.Name)
+			}
+		}
+		if err := add(candidates[0], file); err != nil {
+			return planning.Dataset{}, err
+		}
+	}
+	var incomplete []string
 	for _, supplier := range []string{"iek", "systeme"} {
 		group := groups[supplier]
 		if group == nil {
@@ -124,24 +142,26 @@ func Import(ctx context.Context, files []File, options Options) (planning.Datase
 			}
 		}
 		if len(missing) > 0 {
-			return planning.Dataset{}, fmt.Errorf("%s: missing required workbooks: %s; select all six files together", supplier, strings.Join(missing, ", "))
+			incomplete = append(incomplete, fmt.Sprintf("%s: не хватает файлов: %s.", supplierNames[supplier], strings.Join(missing, ", ")))
+		}
+	}
+	if len(incomplete) > 0 {
+		return planning.Dataset{}, validationError("%s Добавьте недостающие отчёты для указанных поставщиков.", strings.Join(incomplete, " "))
+	}
+	imp := importer{ctx: ctx, options: options, data: planning.EmptyDataset(), products: map[string]*planning.Product{}, stock: map[string]planning.Stock{}, sales: map[saleKey]float64{}, monthly: map[saleKey]float64{}, monthlyDaily: map[saleKey]float64{}, articles: map[string]string{}, orderRules: map[string]bool{}}
+	for _, supplier := range []string{"iek", "systeme"} {
+		group := groups[supplier]
+		if group == nil {
+			continue
 		}
 		stamp, err := time.Parse("02.01.2006", datePattern.FindString(group["incoming"].Name))
 		if err != nil || stamp.Format(planning.DateLayout) != options.AsOf {
-			return planning.Dataset{}, fmt.Errorf("as_of must match the snapshot date in incoming workbook filename %q", group["incoming"].Name)
+			return planning.Dataset{}, validationError("Дата выгрузки должна совпадать с датой в имени файла товаров в пути «%s».", group["incoming"].Name)
 		}
-		name := "IEK"
-		if supplier == "systeme" {
-			name = "Systeme Electric"
-		}
-		imp.data.Suppliers = append(imp.data.Suppliers, planning.Supplier{ID: supplier, Name: name, LeadTimeUnconfirmed: true})
+		imp.data.Suppliers = append(imp.data.Suppliers, planning.Supplier{ID: supplier, Name: supplierNames[supplier], LeadTimeUnconfirmed: true})
 		for _, kind := range kinds {
 			file := group[kind]
-			b, err := openBook(ctx, file.Data, limits)
-			if err == nil {
-				err = imp.consume(b, supplier, kind)
-			}
-			if err != nil {
+			if err := imp.consume(file.book, supplier, kind); err != nil {
 				return planning.Dataset{}, fmt.Errorf("%s: %w", file.Name, err)
 			}
 		}

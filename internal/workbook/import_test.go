@@ -218,12 +218,12 @@ func TestImportRejectsInvalidBatches(t *testing.T) {
 		edit func([]File, *Options) []File
 		want string
 	}{
-		{"missing", func(f []File, _ *Options) []File { return f[:5] }, "missing required"},
-		{"duplicate", func(f []File, _ *Options) []File { return append(f, f[0]) }, "duplicate"},
-		{"unsupported", func(f []File, _ *Options) []File { f[0].Name = "report.xlsx"; return f }, "unrecognized supplier"},
-		{"snapshot", func(f []File, o *Options) []File { o.AsOf = "2026-09-23"; return f }, "snapshot date"},
-		{"date", func(f []File, o *Options) []File { o.HistoryStart = ""; return f }, "required YYYY-MM-DD"},
-		{"interval", func(f []File, o *Options) []File { o.HistoryStart = "2027-01-01"; return f }, "must not be after"},
+		{"missing", func(f []File, _ *Options) []File { return f[:5] }, "не хватает файлов"},
+		{"duplicate", func(f []File, _ *Options) []File { return append(f, f[0]) }, "повторяется отчёт"},
+		{"unsupported", func(f []File, _ *Options) []File { f[0].Name = "report.xls"; return f }, "Выберите исходные файлы .xlsx"},
+		{"snapshot", func(f []File, o *Options) []File { o.AsOf = "2026-09-23"; return f }, "Дата выгрузки должна совпадать"},
+		{"date", func(f []File, o *Options) []File { o.HistoryStart = ""; return f }, "в формате ГГГГ-ММ-ДД"},
+		{"interval", func(f []File, o *Options) []File { o.HistoryStart = "2027-01-01"; return f }, "не может быть позже"},
 		{"archive", func(f []File, _ *Options) []File { f[0].Data = []byte("not zip"); return f }, "invalid XLSX ZIP"},
 		{"headers", func(f []File, _ *Options) []File {
 			for i := range f {
@@ -232,7 +232,7 @@ func TestImportRejectsInvalidBatches(t *testing.T) {
 				}
 			}
 			return f
-		}, "unsupported transaction headers"},
+		}, "Не удалось распознать структуру отчёта"},
 		{"warehouse", func(f []File, _ *Options) []File {
 			for i := range f {
 				if strings.Contains(f[i].Name, "Динамика") {
