@@ -1,0 +1,6 @@
+{
+  "as_of": "2026-09-08",
+  "lookback_days": 7,
+  "review_period_days": 7,
+  "safety_stock_days": 2
+}

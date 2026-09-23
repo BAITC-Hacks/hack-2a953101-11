@@ -1,0 +1,178 @@
+{
+  "suppliers": [
+    {
+      "id": "electro",
+      "name": "Электропоставка",
+      "lead_time_days": 5
+    },
+    {
+      "id": "light",
+      "name": "Светотехника",
+      "lead_time_days": 3
+    }
+  ],
+  "products": [
+    {
+      "id": "cable",
+      "sku": "VVG-3x2.5",
+      "name": "Кабель ВВГ 3×2.5, м",
+      "supplier_id": "electro",
+      "pack_size": 10,
+      "min_order_quantity": 50
+    },
+    {
+      "id": "breaker",
+      "sku": "MCB-16A",
+      "name": "Автомат 16А, шт",
+      "supplier_id": "electro",
+      "pack_size": 6,
+      "min_order_quantity": 6
+    },
+    {
+      "id": "lamp",
+      "sku": "LED-10W",
+      "name": "Лампа LED 10Вт, шт",
+      "supplier_id": "light",
+      "pack_size": 10,
+      "min_order_quantity": 20
+    }
+  ],
+  "sales": [
+    {
+      "product_id": "cable",
+      "date": "2026-09-01",
+      "quantity": 20
+    },
+    {
+      "product_id": "cable",
+      "date": "2026-09-02",
+      "quantity": 20
+    },
+    {
+      "product_id": "cable",
+      "date": "2026-09-03",
+      "quantity": 20
+    },
+    {
+      "product_id": "cable",
+      "date": "2026-09-04",
+      "quantity": 500
+    },
+    {
+      "product_id": "cable",
+      "date": "2026-09-05",
+      "quantity": 20
+    },
+    {
+      "product_id": "cable",
+      "date": "2026-09-06",
+      "quantity": 20
+    },
+    {
+      "product_id": "cable",
+      "date": "2026-09-07",
+      "quantity": 20
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-01",
+      "quantity": 2
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-02",
+      "quantity": 2
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-03",
+      "quantity": 2
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-04",
+      "quantity": 2
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-05",
+      "quantity": 2
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-06",
+      "quantity": 2
+    },
+    {
+      "product_id": "breaker",
+      "date": "2026-09-07",
+      "quantity": 2
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-01",
+      "quantity": 10
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-02",
+      "quantity": 10
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-03",
+      "quantity": 10
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-04",
+      "quantity": 10
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-05",
+      "quantity": 10
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-06",
+      "quantity": 10
+    },
+    {
+      "product_id": "lamp",
+      "date": "2026-09-07",
+      "quantity": 10
+    }
+  ],
+  "stock": [
+    {
+      "product_id": "cable",
+      "on_hand": 40,
+      "reserved": 10
+    },
+    {
+      "product_id": "breaker",
+      "on_hand": 100,
+      "reserved": 0
+    },
+    {
+      "product_id": "lamp",
+      "on_hand": 10,
+      "reserved": 0
+    }
+  ],
+  "shipments": [
+    {
+      "id": "incoming-cable",
+      "product_id": "cable",
+      "quantity": 30,
+      "expected_date": "2026-09-10"
+    },
+    {
+      "id": "incoming-lamp",
+      "product_id": "lamp",
+      "quantity": 10,
+      "expected_date": "2026-09-09"
+    }
+  ]
+}
