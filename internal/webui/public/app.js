@@ -38,6 +38,7 @@ const state = {
   busy: false,
   view: "overview",
   filter: "needed",
+  attention: "all",
   search: "",
   supplier: "",
   pendingImport: null,
@@ -407,16 +408,66 @@ function emptyTable() {
   return `<div class="empty-state"><div class="empty-symbol">${icon("check")}</div><h3>${state.filter === "needed" && !state.search && !state.supplier ? "Запасов достаточно" : "Подходящих товаров нет"}</h3><p>${state.filter === "needed" && !state.search && !state.supplier ? "В выбранном горизонте пополнение не требуется. Все товары доступны на вкладке «Все товары»." : "Попробуйте другой поисковый запрос, поставщика или фильтр."}</p></div>`;
 }
 
-function isAttentionWarning(warning) {
-  // The monthly dataset also puts shared source/method notes in warnings.
-  // Ignore only those notes here; keep unknown warnings and any problem text
-  // combined with a note. The original warnings remain in the product details.
+const attentionKinds = {
+  blocked: { label: "Заказ заблокирован", hint: "Эти товары не попадут в заказ. Откройте товар, исправьте указанные причины и пересчитайте рекомендации." },
+  risk: { label: "Риск дефицита", hint: "Проверьте даты поступлений и согласуйте ускоренную поставку. Просроченные поступления не покрывают потребность." },
+  data: { label: "Данные требуют уточнения", hint: "Откройте товар: в карточке указано, какие остатки, правила заказа или сведения поставщика нужно проверить." },
+};
+
+function actionableWarning(warning) {
+  // Automatic corrections and method notes remain in the calculation details.
+  // Strip only known informational text; preserve unknown and mixed problems.
+  if (["no_regular_demand", "insufficient_positive_days_for_spike_detection"].includes(warning)) return "";
   return warning
     .replace(/^Использовано полных месяцев: \d+\. Пустые ячейки сводных таблиц приняты за 0; отсутствие строки остатка не считается подтверждённым дефицитом\.$/, "")
     .replaceAll("Срок новой поставки отсутствует в источниках: принято 14 дней.", "")
     .replace(/Остаток: месячный срез \d{2}\.\d{2}\.\d{4}, не текущая инвентаризация; проверьте перед заказом\./g, "")
     .replace(/^Остаток датирован \d{4}-\d{2}-\d{2}; выбранная дата не восстанавливает движение склада\.$/, "")
-    .trim().length > 0;
+    .replaceAll("Мало ненулевых месяцев для уверенного выявления месячных всплесков.", "")
+    .replaceAll("Отрицательные месячные продажи (возвраты) ограничены нулём.", "")
+    .trim();
+}
+
+function attentionInfo(line, product) {
+  const reasons = [...new Set([...(line.warnings || []), ...(product?.review_reasons || [])]
+    .map(actionableWarning).filter(Boolean))];
+  const risk = reasons.some((reason) => ["insufficient_supply_during_lead_time", "overdue_shipments_excluded"].includes(reason));
+  // Assign each product to its highest-priority category, so counts add up.
+  const kind = line.blocked ? "blocked" : risk ? "risk" : reasons.length ? "data" : null;
+  return { kind, reasons };
+}
+
+function renderAttentionControls(lines, products) {
+  const controls = $("#attention-controls");
+  controls.hidden = state.view === "shipments" || state.filter !== "attention";
+  if (controls.hidden) return;
+  const counts = { blocked: 0, risk: 0, data: 0 };
+  for (const line of lines) {
+    const { kind } = attentionInfo(line, products.get(line.product_id));
+    if (kind) counts[kind]++;
+  }
+  const total = counts.blocked + counts.risk + counts.data;
+  controls.innerHTML = `<div class="attention-options" role="group" aria-label="Причина внимания">${[
+    ["all", "Все проблемы", total],
+    ...Object.entries(attentionKinds).map(([key, value]) => [key, value.label, counts[key]]),
+  ].map(([key, label, count]) => `<button class="attention-option" data-attention="${key}" aria-pressed="${state.attention === key}">${label} <span>${number(count)}</span></button>`).join("")}</div><p class="attention-hint">${state.attention === "all" ? "Показаны проблемы, требующие действия. Если причин несколько, товар попадает в категорию с наибольшим приоритетом: блокировка, дефицит, уточнение данных. Автоматические корректировки доступны в расчёте товара." : attentionKinds[state.attention].hint}</p>`;
+}
+
+function renderSourceNotice() {
+  const data = state.snapshot?.data;
+  const source = data?.source;
+  const products = new Map((data?.products || []).map((p) => [p.id, p]));
+  const lines = state.result?.products || [];
+  const affected = lines.filter((line) => attentionInfo(line, products.get(line.product_id)).kind).length;
+  const blocked = lines.filter((line) => line.blocked).length;
+  const monthly = Boolean(data?.monthly?.length);
+  const sourceDate = source?.as_of || data?.source_date;
+  const warnings = (source?.warnings || []).filter((w) => !w.startsWith("Подтвердите сроки") || data.suppliers.some((s) => s.lead_time_unconfirmed));
+  if (monthly) warnings.push("Для месячных данных проверьте дату остатков, сроки поставки и правила заказа перед закупкой. Даты и допущения указаны в карточках товаров.");
+  const notice = $("#source-notice");
+  const wasOpen = Boolean($("#source-details")?.open);
+  notice.hidden = !source?.label && !sourceDate && !warnings.length && !affected;
+  notice.innerHTML = `<details id="source-details" ${wasOpen ? "open" : ""}><summary><span><strong>${affected ? `Требуют внимания: ${number(affected)}` : "Источники и допущения"}</strong>${blocked ? `<span class="source-count">Заказ заблокирован: ${number(blocked)}</span>` : ""}</span><span class="source-toggle">Подробнее</span></summary><div class="source-content"><p><strong>${escapeHTML(source?.label || "Данные склада")}</strong>${sourceDate ? ` · Источники на ${date(sourceDate)}` : ""}</p><p>${monthly ? "Для спроса используются завершённые месяцы. Документные продажи помогают корректировать всплески и не прибавляются к месячным итогам." : "Для спроса используются дневные продажи; месячные отчёты служат для сверки."}</p>${[...new Set(warnings)].map((w) => `<p>${escapeHTML(w)}</p>`).join("")}<div class="source-actions">${affected ? '<button class="text-button" data-action="show-attention">Разобрать проблемы</button>' : ""}<button class="text-button" data-action="settings">Проверить параметры расчёта</button></div></div></details>`;
 }
 
 function renderTable() {
@@ -424,29 +475,21 @@ function renderTable() {
     (state.snapshot?.data.suppliers || []).map((s) => [s.id, s.name]),
   );
   if (state.view === "shipments") {
+    $("#attention-controls").hidden = true;
     renderShipments(supplierMap);
     return;
   }
-  let lines = state.result?.products || [];
-  if (state.filter === "needed")
-    lines = lines.filter((line) => line.order_quantity > 0);
-  if (state.filter === "attention") {
-    const products = new Map(
-      (state.snapshot?.data.products || []).map((product) => [product.id, product]),
-    );
-    lines = lines.filter(
-      (line) => line.blocked ||
-        products.get(line.product_id)?.review_reasons?.length > 0 ||
-        line.warnings.some(isAttentionWarning) || line.adjustments.length > 0,
-    );
-  }
-  lines = lines.filter(
-    (line) =>
-      (!state.supplier || line.supplier_id === state.supplier) &&
-      `${line.name} ${line.sku} ${line.internal_code || line.product_id}`
-        .toLocaleLowerCase("ru-RU")
-        .includes(state.search),
+  const products = new Map((state.snapshot?.data.products || []).map((product) => [product.id, product]));
+  let lines = (state.result?.products || []).filter(
+    (line) => (!state.supplier || line.supplier_id === state.supplier) &&
+      `${line.name} ${line.sku} ${line.internal_code || line.product_id}`.toLocaleLowerCase("ru-RU").includes(state.search),
   );
+  renderAttentionControls(lines, products);
+  if (state.filter === "needed") lines = lines.filter((line) => line.order_quantity > 0);
+  if (state.filter === "attention") lines = lines.filter((line) => {
+    const { kind } = attentionInfo(line, products.get(line.product_id));
+    return kind && (state.attention === "all" || kind === state.attention);
+  });
   lines.sort(
     (a, b) =>
       (supplierMap.get(a.supplier_id) || "").localeCompare(
@@ -478,19 +521,12 @@ function renderTable() {
   $("#table-content").innerHTML =
     `<div class="table-scroll"><table><thead><tr><th scope="col">Товар / Артикул</th><th scope="col">Поставщик</th><th scope="col">Прогноз спроса</th><th scope="col">Доступно</th><th scope="col">В пути</th><th scope="col">К закупке</th><th scope="col">Статус</th><th scope="col"><span class="muted">Обоснование</span></th></tr></thead><tbody>${lines
       .map((line, index) => {
-        const risk = line.warnings.includes(
-          "insufficient_supply_during_lead_time",
-        );
-        const adjusted = line.adjustments.length > 0;
-        const status = line.blocked
-          ? ["orange", "Нужна проверка"]
-          : risk
-            ? ["orange", "Риск дефицита"]
-            : adjusted
-              ? ["purple", "Спрос скорректирован"]
-              : line.order_quantity > 0
-                ? ["purple", "К закупке"]
-                : ["green", "Запас в норме"];
+        const { kind } = attentionInfo(line, products.get(line.product_id));
+        const status = kind
+          ? ["orange", attentionKinds[kind].label]
+          : line.adjustments.length > 0
+            ? ["purple", "Спрос скорректирован"]
+            : line.order_quantity > 0 ? ["purple", "К закупке"] : ["green", "Запас в норме"];
         return `<tr><td><div class="product-cell"><span class="product-icon">${icon("box")}</span><div><div class="product-name">${escapeHTML(line.name)}</div><div class="product-sku">${escapeHTML(line.sku)}${line.internal_code ? ` · 1С: ${escapeHTML(line.internal_code)}` : ""}${line.unit ? ` · ${escapeHTML(line.unit)}` : ""}</div></div></div></td><td>${escapeHTML(supplierMap.get(line.supplier_id))}</td><td class="numeric">${number(line.forecast_demand, 1)}</td><td class="numeric">${number(line.available_stock)}</td><td class="numeric">${number(line.incoming_quantity)}</td><td class="order-quantity numeric">${line.order_quantity ? number(line.order_quantity) : "—"}</td><td><span class="badge ${status[0]}">${status[1]}</span></td><td><details data-explanation="${escapeHTML(line.product_id)}"><summary aria-controls="explanation-${index}">Обоснование</summary></details><button class="row-detail" data-detail="${escapeHTML(line.product_id)}" aria-label="Расчёт для ${escapeHTML(line.name)}">${icon("chevron")}</button></td></tr>`;
       })
       .join("")}</tbody></table></div>`;
@@ -530,26 +566,7 @@ function renderShipments(supplierMap) {
 }
 
 function render() {
-  const source = state.snapshot?.data.source;
-  const blocked = (state.result?.products || []).filter(
-    (p) => p.blocked,
-  ).length;
-  $("#source-notice").hidden = !source?.label && !blocked;
-  $("#source-notice").innerHTML =
-    `<strong>${escapeHTML(source?.label || "Проверка данных")}</strong>${source?.as_of ? ` · Источники на ${date(source.as_of)}` : ""}<p>${blocked ? `${blocked} товаров требуют проверки и исключены из экспорта. ` : ""}Месячные отчёты сверены с операциями; для спроса используются дневные продажи.</p>${(
-      source?.warnings || []
-    )
-      .filter(
-        (w) =>
-          !w.startsWith("Подтвердите сроки") ||
-          state.snapshot.data.suppliers.some(
-            (supplier) => supplier.lead_time_unconfirmed,
-          ),
-      )
-      .map((w) => `<p>${escapeHTML(w)}</p>`)
-      .join(
-        "",
-      )}<button class="text-button" data-action="settings">Настроить сроки поставки</button>`;
+  renderSourceNotice();
   $("#planning-date").textContent = date(state.params.as_of);
   $("#history-label").textContent = `${state.params.lookback_days} дней`;
   $("#overview-section").hidden = state.view !== "overview";
@@ -707,6 +724,67 @@ async function realExample() {
   showDetail(id);
 }
 
+function issueGuidance(reason) {
+  if (["insufficient_supply_during_lead_time", "overdue_shipments_excluded"].includes(reason))
+    return { topic: "shipments", label: "Проверить поставки", help: "Уточните даты поступлений у поставщика. При риске дефицита согласуйте ускоренную поставку; просроченные количества не уменьшают потребность." };
+  if (/lead_time|срок.*постав/i.test(reason))
+    return { topic: "lead", label: "Подтвердить срок", help: "Укажите согласованный срок нового заказа в параметрах расчёта." };
+  if (/history|sales_window|истори|полных месяцев/i.test(reason))
+    return { topic: "history", label: "Проверить период", help: "Сопоставьте выбранную дату и глубину анализа с периодом ваших отчётов. Если истории нет, загрузите полную выгрузку продаж." };
+  if (/unit|единиц|бухт/i.test(reason))
+    return { topic: "units", label: "Как уточнить единицы", help: "Согласуйте перевод закупочных единиц в складские. Остатки, продажи, поставки и правила заказа должны использовать одну единицу." };
+  if (/order_rules|MOQ|кратност|минимум/i.test(reason))
+    return { topic: "rules", label: "Как уточнить правила", help: "Подтвердите у поставщика минимальную партию и кратность заказа. Исправьте их в исходном наборе и загрузите полный комплект заново." };
+  if (/article|артикул/i.test(reason))
+    return { topic: "articles", label: "Как проверить артикул", help: "Сверьте артикул поставщика с кодом 1С. Исправьте сопоставление в исходных данных, сохранив разные коды как отдельные товары." };
+  if (/stock|остат|резерв/i.test(reason))
+    return { topic: "stock", label: "Как обновить остаток", help: "Получите актуальные остатки и резервы на дату расчёта. Исправьте расхождения и загрузите полный обновлённый набор данных." };
+  return { topic: "data", label: "Как проверить данные", help: "Сверьте сообщение с исходными отчётами по этому товару. Исправьте причину в данных, загрузите обновлённый набор и пересчитайте рекомендации." };
+}
+
+function issueCards(line, product) {
+  const { kind, reasons } = attentionInfo(line, product);
+  if (!kind) return "";
+  if (!reasons.length) reasons.push("Расчёт заблокирован: проверьте исходные данные товара.");
+  return `<section class="product-issues" aria-label="Что нужно сделать"><h3>${attentionKinds[kind].label}</h3>${reasons.map((reason) => {
+    const guide = issueGuidance(reason);
+    return `<div class="product-issue"><strong>${escapeHTML(warningLabels[reason] || reason)}</strong><p>${guide.help}</p><button class="text-button" data-action="resolve-issue" data-product="${escapeHTML(line.product_id)}" data-topic="${guide.topic}">${guide.label}</button></div>`;
+  }).join("")}</section>`;
+}
+
+function resolveIssue(id, topic) {
+  const product = state.snapshot?.data.products.find((p) => p.id === id);
+  if (!product) return;
+  if (topic === "lead" || topic === "history") { settings(); return; }
+  if (topic === "shipments") {
+    closeModal();
+    state.view = "shipments";
+    state.supplier = product.supplier_id;
+    state.search = (product.internal_code || product.sku).toLocaleLowerCase("ru-RU");
+    $("#search").value = product.internal_code || product.sku;
+    state.page = 1;
+    render();
+    return;
+  }
+  const guides = {
+    stock: ["Обновить остаток", "Выгрузите актуальный остаток, резерв и дату среза. Сверьте свободное количество: остаток минус резерв. При получении поставки обновите остаток и количество в пути вместе."],
+    rules: ["Уточнить правила заказа", "Запросите у поставщика минимальную партию и кратность. Это разные ограничения: минимум задаёт нижнюю границу заказа, кратность — допустимый шаг количества."],
+    units: ["Согласовать единицы", "Подтвердите, сколько метров или штук в одной закупочной единице. Приведите продажи, остатки, поставки, минимум и кратность к одной базовой единице товара."],
+    articles: ["Проверить артикул", "Сопоставьте точный код 1С с артикулом поставщика. Не объединяйте разные коды только из-за совпадения названия или артикула."],
+    data: ["Проверить исходные данные", "Сверьте сведения по товару с отчётами поставщика и склада. Исправьте указанные в карточке причины до подтверждения заказа."],
+  };
+  const [title, instruction] = guides[topic] || guides.data;
+  openModal(title, `<p class="modal-copy"><strong>${escapeHTML(product.name)}</strong> · ${escapeHTML(product.sku)}</p><p>${instruction}</p><ol class="method-list"><li>Скачайте текущие данные, чтобы сохранить резервную копию.</li><li>Исправьте источник и подготовьте полный комплект Excel или JSON. В JSON удалите причины проверки товара только после их устранения.</li><li>Загрузите обновлённый набор, проверьте результат и подтвердите замену.</li><li>Пересчитайте рекомендации и проверьте карточку товара.</li></ol><p class="notice">Загрузка заменяет весь склад, поэтому сохраните в наборе остальных поставщиков и товары.</p><div class="modal-actions"><button class="button secondary" data-detail="${escapeHTML(id)}">Назад к товару</button><button class="button secondary" data-action="backup">Скачать текущие данные</button><button class="button primary" data-action="import">Загрузить данные</button></div>`);
+}
+
+function orderSummary(line, product) {
+  const unit = escapeHTML(line.unit || product.unit || "ед.");
+  const finalLabel = line.blocked ? "Заказ заблокирован" : line.order_quantity > 0 ? "Заказать" : "Заказывать не нужно";
+  return `<section class="order-summary" aria-label="Короткий расчёт заказа"><div class="order-equation">${[
+    ["Нужно", line.target_stock], ["Есть", line.available_stock], ["Приедет", line.incoming_quantity], [finalLabel, line.order_quantity],
+  ].map(([label, quantity], i) => `<div class="order-step ${i === 3 ? "order-result" : ""}"><span>${label}</span><strong>${number(quantity)} <small>${unit}</small></strong></div>`).join("")}</div><p>Нужно — целевой запас со страховкой. Есть — остаток за вычетом резерва. Приедет — поставки в пределах горизонта.</p><p>Чистая потребность: <strong>${number(line.net_requirement)} ${unit}</strong>. Минимум: ${number(product.min_order_quantity)}; кратность: ${number(product.pack_size)}.${line.blocked ? ` Предварительно: ${number(line.suggested_quantity)} ${unit}; в заказ и экспорт товар не включён.` : line.order_quantity > line.net_requirement ? " Количество увеличено до минимума и округлено по кратности." : ""}</p></section>`;
+}
+
 function showDetail(id) {
   const line = state.result?.products.find((p) => p.product_id === id);
   if (!line) return;
@@ -744,7 +822,9 @@ function showDetail(id) {
   ];
   openModal(
     line.name,
-    `<p class="modal-copy">${escapeHTML(line.explanation || "")}</p><p class="modal-copy">${escapeHTML(line.sku)} · Покрытие до ${date(line.coverage_end)}</p>${calculationTrace(line, product, stock)}<div class="detail-grid">${pairs.map(([label, value]) => `<div class="detail-item"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div><div class="detail-total"><span>${line.blocked ? "Черновик · нужна проверка" : "Рекомендовано к закупке"}</span><strong>${number(line.blocked ? line.suggested_quantity : line.order_quantity)}</strong></div>${line.adjustments.length ? `<h3 class="detail-subtitle">Корректировки продаж</h3>${line.adjustments.map((a) => `<div class="adjustment-row"><span>${date(a.date)} · ${a.reason === "sales_spike" ? "Всплеск" : a.reason === "stockout_compensation" ? "Вероятное отсутствие товара" : a.reason === "net_returns" ? "Возврат" : "Ручное исключение"}</span><strong>${number(a.original_quantity)} → ${number(a.used_quantity, 1)}</strong></div>`).join("")}` : ""}${line.warnings.length ? `<h3 class="detail-subtitle">Обратите внимание</h3><ul class="warning-list">${line.warnings.map((w) => `<li>${escapeHTML(warningLabels[w] || w)}</li>`).join("")}</ul>` : ""}<div class="modal-actions"><button class="button primary" data-action="close-modal">Готово</button></div>`,
+    `<p class="modal-copy">${escapeHTML(line.sku)} · Покрытие до ${date(line.coverage_end)}</p>
+    ${orderSummary(line, product)}${issueCards(line, product)}
+    <details id="calculation-details" class="calculation-details"><summary>Подробный расчёт</summary><p class="modal-copy">${escapeHTML(line.explanation || "")}</p>${calculationTrace(line, product, stock)}<div class="detail-grid">${pairs.map(([label, value]) => `<div class="detail-item"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div>${line.adjustments.length ? `<h3 class="detail-subtitle">Корректировки продаж</h3>${line.adjustments.map((a) => `<div class="adjustment-row"><span>${date(a.date)} · ${a.reason === "sales_spike" ? "Всплеск" : a.reason === "stockout_compensation" ? "Вероятное отсутствие товара" : a.reason === "net_returns" ? "Возврат" : "Ручное исключение"}</span><strong>${number(a.original_quantity)} → ${number(a.used_quantity, 1)}</strong></div>`).join("")}` : ""}${line.warnings.length ? `<h3 class="detail-subtitle">Пояснения и сообщения источника</h3><ul class="warning-list">${line.warnings.map((w) => `<li>${escapeHTML(warningLabels[w] || w)}</li>`).join("")}</ul>` : ""}</details><div class="modal-actions"><button class="button primary" data-action="close-modal">Готово</button></div>`,
   );
 }
 
@@ -993,6 +1073,7 @@ async function confirmImport() {
       state.params.as_of = shiftDate(pending.data.source.as_of, 1);
       state.filter = "attention";
     }
+    state.attention = "all";
     state.page = 1;
     state.pendingImport = null;
     state.search = "";
@@ -1091,6 +1172,7 @@ document.addEventListener("click", async (event) => {
     state.page = 1;
     state.view = view.dataset.view;
     state.filter = "needed";
+    state.attention = "all";
     $("#sidebar").classList.remove("open");
     $(".mobile-menu").setAttribute("aria-expanded", "false");
     syncSidebar();
@@ -1101,7 +1183,15 @@ document.addEventListener("click", async (event) => {
   if (filter) {
     state.page = 1;
     state.filter = filter.dataset.filter;
+    state.attention = "all";
     render();
+    return;
+  }
+  const attention = event.target.closest("[data-attention]");
+  if (attention) {
+    state.page = 1;
+    state.attention = attention.dataset.attention;
+    renderTable();
     return;
   }
   const detail = event.target.closest("[data-detail]");
@@ -1131,6 +1221,21 @@ document.addEventListener("click", async (event) => {
     if (action === "next-page") {
       state.page += 1;
       renderTable();
+    }
+    if (action === "show-attention") {
+      state.view = "orders";
+      state.filter = "attention";
+      state.attention = "all";
+      state.search = "";
+      state.supplier = "";
+      state.page = 1;
+      $("#search").value = "";
+      render();
+      $("#results-panel").scrollIntoView({ block: "start" });
+    }
+    if (action === "resolve-issue") {
+      const button = event.target.closest("[data-action='resolve-issue']");
+      resolveIssue(button.dataset.product, button.dataset.topic);
     }
     if (action === "close-modal") closeModal();
     if (action === "connect") connect();

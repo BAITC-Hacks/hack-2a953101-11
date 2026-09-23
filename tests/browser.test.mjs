@@ -299,6 +299,7 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       await page.getByLabel("Поиск товаров").fill("ВВГ");
       assert.equal(await page.locator("table tbody tr").count(), 1);
       await page.locator("[data-detail='cable']").click();
+      await page.locator("#calculation-details > summary").click();
       await page
         .getByRole("heading", { name: "Корректировки продаж" })
         .waitFor();
@@ -684,10 +685,13 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       assert.equal(imported.data.data.products.length, 3909);
       assert.equal(imported.data.data.sales.length, 140922);
       assert.equal(imported.data.data.shipments.length, 313);
+      if (!(await page.locator("#source-details").evaluate((el) => el.open)))
+        await page.locator("#source-details > summary").click();
       await page
         .locator("#source-notice")
         .getByText("IEK / Systeme Electric · Алматы", { exact: true })
         .waitFor();
+      await page.locator("#source-details > summary").click();
       assert.equal(await page.locator("table tbody tr").count(), 100);
       assert.equal(await page.locator("#export-button").isDisabled(), true);
 
@@ -720,10 +724,13 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
         .click();
       await page.locator("#modal").waitFor({ state: "hidden" });
       await loaded();
+      if (!(await page.locator("#source-details").evaluate((el) => el.open)))
+        await page.locator("#source-details > summary").click();
       await page
         .locator("#source-notice")
         .getByText("IEK / Systeme Electric · Алматы", { exact: true })
         .waitFor();
+      await page.locator("#source-details > summary").click();
       assert.equal(await page.locator("table tbody tr").count(), 100);
       assert.equal(await page.locator("#export-button").isDisabled(), true);
       await page.getByLabel("Поиск товаров").fill("130200015_");
@@ -731,6 +738,7 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       await page
         .getByRole("button", { name: "Расчёт для", exact: false })
         .click();
+      await page.locator("#calculation-details > summary").click();
       await page
         .locator("#modal")
         .getByText("43,2 / 0", { exact: true })
@@ -785,6 +793,11 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     await page.locator("#modal").waitFor({ state: "hidden" });
     await loaded();
     await page.getByRole("button", { name: "Пример расчёта", exact: true }).click();
+    await page.locator(".order-summary").waitFor();
+    assert.equal(await page.locator("#calculation-details").getAttribute("open"), null);
+    assert.deepEqual(await page.locator(".order-step strong").allTextContents(), ["7 ед.", "0 ед.", "5 ед.", "2 ед."]);
+    if (process.env.UI_SCREENSHOT_DIR) await page.screenshot({ path: join(process.env.UI_SCREENSHOT_DIR, "order-summary.png") });
+    await page.locator("#calculation-details > summary").click();
     await page.locator("#calculation-trace").waitFor();
     assert.match(await page.locator("#modal-title").innerText(), /Реле напряжения/);
     const trace = await page.locator("#calculation-trace").innerText();
@@ -855,12 +868,14 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
         "Использовано полных месяцев: 12. Пустые ячейки сводных таблиц приняты за 0; отсутствие строки остатка не считается подтверждённым дефицитом.",
         "Остаток: месячный срез 01.09.2026, не текущая инвентаризация; проверьте перед заказом. Срок новой поставки отсутствует в источниках: принято 14 дней. ",
         "Остаток датирован 2026-09-01; выбранная дата не восстанавливает движение склада.",
+        "no_regular_demand", "insufficient_positive_days_for_spike_detection",
+        "Мало ненулевых месяцев для уверенного выявления месячных всплесков.",
       ] },
       { id: "purchase", order_quantity: 5 },
       { id: "warning", warnings: ["overdue_shipments_excluded"] },
       { id: "risk", order_quantity: 2, warnings: ["insufficient_supply_during_lead_time"] },
       { id: "adjusted", adjustments: [{ date: "2026-08-01", original_quantity: 100, used_quantity: 10, reason: "sales_spike" }] },
-      { id: "blocked", blocked: true },
+      { id: "blocked", blocked: true, target_stock: 20, available_stock: 5, incoming_quantity: 0, net_requirement: 15, suggested_quantity: 15, warnings: ["insufficient_supply_during_lead_time"] },
       { id: "review", review_reasons: ["missing_order_rules"] },
       { id: "text-warning", warnings: ["Остаток отсутствует: для предварительного расчёта принят 0, требуется проверка."] },
       { id: "mixed-warning", warnings: ["Остаток: месячный срез 01.09.2026, не текущая инвентаризация; проверьте перед заказом. MOQ/кратность не подтверждены: расчёт по 1 единице. Срок новой поставки отсутствует в источниках: принято 14 дней."] },
@@ -874,6 +889,7 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
     }));
     fixture.data.stock = cases.map(({ id }) => ({ product_id: id, on_hand: 100, reserved: 0 }));
     fixture.data.sales = [];
+    fixture.data.source = { label: "Проверочный источник", as_of: "2026-09-22", warnings: ["Общее предупреждение <img src=x onerror=alert(1)>"] };
     fixture.data.monthly = [];
     fixture.data.shipments = [];
     const template = result.products[0];
@@ -906,12 +922,71 @@ test("purchasing dashboard end-to-end", { timeout: 180000 }, async (t) => {
       await checkTab("all", cases.map(({ id }) => id));
       assert.equal(await page.locator("#table-content tr").filter({ has: page.locator("[data-detail='healthy']") }).locator(".badge").innerText(), "Запас в норме");
       await page.locator("[data-detail='information']").click();
+      await page.locator("#calculation-details > summary").click();
       const details = await page.locator("#modal-body").innerText();
       for (const note of cases.find(({ id }) => id === "information").warnings) {
-        assert.ok(details.includes(note.trim()), "informational notes remain in product details");
+        const label = {
+          no_regular_demand: "В выбранном периоде нет регулярного спроса",
+          insufficient_positive_days_for_spike_detection: "Мало дней с продажами для надёжной фильтрации всплесков",
+        }[note] || note.trim();
+        assert.ok(details.includes(label), "informational notes remain in product details");
       }
       await page.locator("#modal").getByRole("button", { name: "Готово", exact: true }).click();
-      await checkTab("attention", ["warning", "risk", "adjusted", "blocked", "review", "text-warning", "mixed-warning", "stock-warning", "lead-warning", "unknown-warning"]);
+      await checkTab("attention", ["warning", "risk", "blocked", "review", "text-warning", "mixed-warning", "stock-warning", "lead-warning", "unknown-warning"]);
+      assert.equal(await page.locator("#source-details").getAttribute("open"), null);
+      assert.equal(await page.locator(".source-content").isVisible(), false);
+      const banner = await page.locator("#source-notice").boundingBox();
+      assert.ok(banner.height < 100, "warnings stay compact until expanded");
+      await page.locator("#source-details > summary").click();
+      assert.match(await page.locator(".source-content").innerText(), /Общее предупреждение/);
+      assert.equal(await page.locator("#source-notice img").count(), 0);
+      await page.locator("[data-action='show-attention']").click();
+      assert.equal(await page.locator(".tab[data-filter='attention']").getAttribute("aria-pressed"), "true");
+      await page.locator("#source-details > summary").click();
+
+      const checkReason = async (kind, expected) => {
+        await page.locator(`[data-attention='${kind}']`).click();
+        assert.deepEqual(await visibleIDs(), [...expected].sort(), kind);
+        assert.equal(await page.locator(`#attention-controls [data-attention='${kind}'] span`).innerText(), String(expected.length));
+        assert.equal(await page.locator(`[data-attention='${kind}']`).getAttribute("aria-pressed"), "true");
+      };
+      await checkReason("blocked", ["blocked"]);
+      await page.locator("[data-detail='blocked']").click();
+      assert.match(await page.locator(".order-result").innerText(), /Заказ заблокирован/);
+      assert.match(await page.locator(".order-result strong").innerText(), /^0 /);
+      assert.match(await page.locator(".order-summary").innerText(), /Предварительно: 15/);
+      assert.equal(await page.locator("#calculation-details").getAttribute("open"), null);
+      await page.setViewportSize({ width: 390, height: 844 });
+      assert.ok(await page.locator("#modal").evaluate((el) => el.scrollWidth <= el.clientWidth));
+      if (process.env.UI_SCREENSHOT_DIR) await page.screenshot({ path: join(process.env.UI_SCREENSHOT_DIR, "blocked-order-mobile.png") });
+      await page.getByRole("button", { name: "Готово", exact: true }).click();
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+      if (process.env.UI_SCREENSHOT_DIR) await page.screenshot({ path: join(process.env.UI_SCREENSHOT_DIR, "attention-mobile.png"), fullPage: true });
+      await page.setViewportSize({ width: 1440, height: 1100 });
+
+      await checkReason("risk", ["warning", "risk"]);
+      await page.locator("[data-detail='risk']").click();
+      await page.getByRole("button", { name: "Проверить поставки", exact: true }).click();
+      assert.equal(await page.locator("#modal").isVisible(), false);
+      assert.equal(await page.locator("#page-title").innerText(), "Товары в пути");
+      assert.equal(await page.getByLabel("Поиск товаров").inputValue(), fixture.data.products.find((p) => p.id === "risk").internal_code || "risk");
+      await page.locator("[data-view='orders']").click();
+      await page.getByLabel("Поиск товаров").fill("");
+      await page.getByLabel("Поставщик", { exact: true }).selectOption("");
+      await page.locator(".tab[data-filter='attention']").click();
+      await checkReason("data", ["review", "text-warning", "mixed-warning", "stock-warning", "lead-warning", "unknown-warning"]);
+      await page.locator("[data-detail='stock-warning']").click();
+      await page.getByRole("button", { name: "Как обновить остаток", exact: true }).click();
+      assert.equal(await page.locator("#modal-title").innerText(), "Обновить остаток");
+      assert.equal(await page.getByRole("button", { name: "Скачать текущие данные", exact: true }).isVisible(), true);
+      await page.getByRole("button", { name: "Назад к товару", exact: true }).click();
+      await page.getByRole("button", { name: "Готово", exact: true }).click();
+      await page.locator("[data-detail='lead-warning']").click();
+      await page.getByRole("button", { name: "Подтвердить срок", exact: true }).click();
+      assert.equal(await page.locator("#settings-form").isVisible(), true);
+      await page.getByRole("button", { name: "Отмена", exact: true }).click();
+      await checkReason("all", ["warning", "risk", "blocked", "review", "text-warning", "mixed-warning", "stock-warning", "lead-warning", "unknown-warning"]);
+      if (process.env.UI_SCREENSHOT_DIR) await page.screenshot({ path: join(process.env.UI_SCREENSHOT_DIR, "attention-desktop.png"), fullPage: true });
       await page.getByLabel("Поиск товаров").fill("healthy");
       assert.deepEqual(await visibleIDs(), []);
       await page.getByLabel("Поиск товаров").fill("");
