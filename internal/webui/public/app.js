@@ -12,7 +12,7 @@ const escapeHTML = (value) =>
   );
 const icon = (name) =>
   `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
-const number = (value, digits = 0) =>
+const number = (value, digits = 2) =>
   new Intl.NumberFormat("ru-RU", { maximumFractionDigits: digits }).format(
     value,
   );
@@ -29,6 +29,8 @@ const shiftDate = (value, days) => {
   return d.toISOString().slice(0, 10);
 };
 const state = {
+  page: 1,
+  pageSize: 100,
   key: "",
   snapshot: null,
   etag: null,
@@ -47,6 +49,25 @@ const state = {
   },
 };
 const warningLabels = {
+  lead_time_unconfirmed: "Подтвердите срок нового заказа у поставщика",
+  stock_unverified: "Нет подтверждённого остатка по этому коду 1С",
+  stock_snapshot_outdated:
+    "Дата остатка не соответствует дате расчёта; нужен актуальный снимок",
+  missing_order_rules:
+    "Минимум или кратность заказа отсутствует либо содержит ошибку Excel",
+  conflicting_order_rules: "В источнике противоречивые ограничения заказа",
+  supplier_article_conflict:
+    "Одному коду 1С соответствуют разные артикулы поставщика",
+  supplier_article_missing: "Нет подтверждённого артикула поставщика",
+  purchase_unit_conversion_unconfirmed:
+    "Закупка бухтами, учёт метрами: подтвердите пересчёт единиц",
+  unit_conflict: "Источники используют разные единицы измерения",
+  stock_reservation_mismatch:
+    "Свободный остаток не совпадает с остатком минус резерв",
+  negative_stock: "Источник содержит отрицательный остаток",
+  invalid_current_stock: "Некорректный текущий остаток или резерв",
+  incomplete_sales_window: "Расчёт ограничен доступным периодом истории",
+  history_unavailable: "Для выбранного периода нет полной истории",
   insufficient_positive_days_for_spike_detection:
     "Мало дней с продажами для надёжной фильтрации всплесков",
   no_regular_demand: "В выбранном периоде нет регулярного спроса",
@@ -55,6 +76,8 @@ const warningLabels = {
     "Есть риск дефицита до поступления нового заказа",
 };
 let toastTimer;
+let importRequest = 0;
+let xlsxImport = null;
 const mobileLayout = window.matchMedia("(max-width: 680px)");
 
 function syncSidebar() {
@@ -91,15 +114,19 @@ function showError(error) {
 }
 
 async function api(path, options = {}) {
-  const headers = new Headers(options.headers);
+  const { timeout = 30000, signal, ...requestOptions } = options;
+  const headers = new Headers(requestOptions.headers);
   if (state.key) headers.set("Authorization", `Bearer ${state.key}`);
-  if (options.body) headers.set("Content-Type", "application/json");
+  if (requestOptions.body && !(requestOptions.body instanceof FormData))
+    headers.set("Content-Type", "application/json");
   let response;
   try {
     response = await fetch(`/api/v1/${path}`, {
-      ...options,
+      ...requestOptions,
       headers,
-      signal: AbortSignal.timeout(30000),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeout)])
+        : AbortSignal.timeout(timeout),
     });
   } catch {
     throw new Error(
@@ -123,7 +150,7 @@ function busy(value) {
   $("#loading").hidden = !value;
   $("#main").setAttribute("aria-busy", String(value));
   $$(
-    "[data-action='real-example'], [data-action='calculate'], [data-action='import'], [data-action='settings'], [data-action='refresh'], [data-action='connect'], [data-action='demo']",
+    "[data-action='excel'], [data-action='real-example'], [data-action='calculate'], [data-action='import'], [data-action='settings'], [data-action='refresh'], [data-action='connect'], [data-action='demo']",
   ).forEach((el) => {
     el.disabled = value;
   });
@@ -139,7 +166,8 @@ async function getSnapshot() {
   if (!state.snapshot && snapshot.data.source_date) {
     state.params.as_of = shiftDate(snapshot.data.source_date, 1);
     state.params.lookback_days = 365;
-  }
+  } else if (!state.snapshot && snapshot.data.source?.as_of)
+    state.params.as_of = shiftDate(snapshot.data.source.as_of, 1);
   state.snapshot = snapshot;
   state.etag = response.headers.get("ETag");
   state.result = null;
@@ -258,7 +286,19 @@ function renderChart() {
       `<div class="chart-empty">${icon("chart")}<br>Ваша история продаж станет понятным графиком.<br>Загрузите данные, чтобы увидеть динамику спроса.</div>`;
     return;
   }
-  const size = result.parameters.lookback_days;
+  const size = Math.max(
+    0,
+    Math.round(
+      (new Date(result.history_end_exclusive) -
+        new Date(result.history_start)) /
+        86400000,
+    ),
+  );
+  if (!size) {
+    $("#demand-chart").innerHTML =
+      '<div class="chart-empty">Нет истории за выбранный период</div>';
+    return;
+  }
   const start = result.history_start;
   const points = Array.from({ length: size }, (_, i) => ({
     date: shiftDate(start, i),
@@ -309,6 +349,7 @@ function renderChart() {
   if (state.snapshot.data.monthly?.length) $("#chart-period").textContent = "Месячные итоги, среднее за день";
   const max = Math.max(1, ...points.map((p) => Math.max(p.raw, p.adjusted)));
   const top = Math.ceil(max / 4) * 4;
+  const low = Math.min(0, ...points.map((p) => p.raw));
   const width = Math.max(280, $("#demand-chart").clientWidth - 36),
     height = 165,
     left = 40,
@@ -316,7 +357,8 @@ function renderChart() {
     bottom = 26,
     yTop = 8;
   const x = (i) => left + (i / Math.max(1, size - 1)) * (width - left - right);
-  const y = (v) => height - bottom - (v / top) * (height - bottom - yTop);
+  const y = (v) =>
+    height - bottom - ((v - low) / (top - low)) * (height - bottom - yTop);
   const path = (key) =>
     points
       .map(
@@ -324,13 +366,13 @@ function renderChart() {
       )
       .join(" ");
   const grid = Array.from({ length: 5 }, (_, i) => {
-    const value = (top * i) / 4;
+    const value = low + ((top - low) * i) / 4;
     return `<line class="grid" x1="${left}" y1="${y(value)}" x2="${width - right}" y2="${y(value)}"/><text x="${left - 10}" y="${y(value) + 3}" text-anchor="end">${number(value)}</text>`;
   }).join("");
   const labels = Array.from(
     new Set(
       Array.from({ length: Math.min(6, size) }, (_, i) =>
-        Math.round((i * (size - 1)) / (Math.min(6, size) - 1)),
+        Math.round((i * (size - 1)) / Math.max(1, Math.min(6, size) - 1)),
       ),
     ),
   )
@@ -357,6 +399,11 @@ function emptyTable() {
     return `<div class="empty-state"><div class="empty-symbol">${icon("box")}</div><h3>Хороший план начинается с ваших данных</h3><p>Загрузите продажи, остатки и поставки. Мы рассчитаем, какие товары и в каком количестве пора заказать.</p><button class="button primary" data-action="import">${icon("upload")}Загрузить данные</button><button class="button secondary" data-action="demo">Попробовать демо</button></div>`;
   if (!state.result)
     return `<div class="empty-state"><div class="empty-symbol">${icon("refresh")}</div><h3>Нужен новый расчёт</h3><p>Данные загружены. Рассчитайте закупку, чтобы увидеть актуальные предложения.</p><button class="button primary" data-action="calculate">Рассчитать закупку</button></div>`;
+  if (
+    state.result?.products.some((p) => p.blocked) &&
+    state.filter === "needed"
+  )
+    return '<div class="empty-state"><h3>Нужна проверка исходных данных</h3><p>Часть товаров исключена из заказов из-за неподтверждённых остатков, сроков или ограничений. Откройте вкладку «Требуют внимания».</p><button class="button secondary" data-filter="attention">Требуют внимания</button></div>';
   return `<div class="empty-state"><div class="empty-symbol">${icon("check")}</div><h3>${state.filter === "needed" && !state.search && !state.supplier ? "Запасов достаточно" : "Подходящих товаров нет"}</h3><p>${state.filter === "needed" && !state.search && !state.supplier ? "В выбранном горизонте пополнение не требуется. Все товары доступны на вкладке «Все товары»." : "Попробуйте другой поисковый запрос, поставщика или фильтр."}</p></div>`;
 }
 
@@ -378,7 +425,7 @@ function renderTable() {
   lines = lines.filter(
     (line) =>
       (!state.supplier || line.supplier_id === state.supplier) &&
-      `${line.name} ${line.sku}`
+      `${line.name} ${line.sku} ${line.internal_code || ""}`
         .toLocaleLowerCase("ru-RU")
         .includes(state.search),
   );
@@ -393,6 +440,19 @@ function renderTable() {
   $("#result-caption").textContent = state.result
     ? `Показано ${number(lines.length)} из ${number(state.result.products.length)} товаров · ${date(state.result.parameters.as_of)}`
     : "Загрузите данные для начала работы";
+  const pageCount = Math.max(1, Math.ceil(lines.length / state.pageSize));
+  state.page = Math.min(state.page, pageCount);
+  $("#pagination").hidden = pageCount <= 1;
+  $("#pagination").innerHTML =
+    `<button class="button secondary compact" data-action="previous-page" ${state.page === 1 ? "disabled" : ""}>←</button><span>${state.page} / ${pageCount}</span><button class="button secondary compact" data-action="next-page" ${state.page === pageCount ? "disabled" : ""}>→</button>`;
+  const total = lines.length;
+  lines = lines.slice(
+    (state.page - 1) * state.pageSize,
+    state.page * state.pageSize,
+  );
+  if (state.result)
+    $("#result-caption").textContent =
+      `Показано ${lines.length} из ${total} · ${date(state.result.parameters.as_of)}`;
   if (!lines.length) {
     $("#table-content").innerHTML = emptyTable();
     return;
@@ -404,19 +464,22 @@ function renderTable() {
           "insufficient_supply_during_lead_time",
         );
         const adjusted = line.adjustments.length > 0;
-        const status = risk
-          ? ["orange", "Риск дефицита"]
-          : adjusted
-            ? ["purple", "Спрос скорректирован"]
-            : line.order_quantity > 0
-              ? ["purple", "К закупке"]
-              : ["green", "Запас в норме"];
-        return `<tr><td><div class="product-cell"><span class="product-icon">${icon("box")}</span><div><div class="product-name">${escapeHTML(line.name)}</div><div class="product-sku">${escapeHTML(line.sku)}</div></div></div></td><td>${escapeHTML(supplierMap.get(line.supplier_id))}</td><td class="numeric">${number(line.forecast_demand, 1)}</td><td class="numeric">${number(line.available_stock)}</td><td class="numeric">${number(line.incoming_quantity)}</td><td class="order-quantity numeric">${line.order_quantity ? number(line.order_quantity) : "—"}</td><td><span class="badge ${status[0]}">${status[1]}</span></td><td><details><summary>Обоснование</summary><p>${escapeHTML(line.explanation || "")}</p></details><button class="row-detail" data-detail="${escapeHTML(line.product_id)}" aria-label="Расчёт для ${escapeHTML(line.name)}">${icon("chevron")}</button></td></tr>`;
+        const status = line.blocked
+          ? ["orange", "Нужна проверка"]
+          : risk
+            ? ["orange", "Риск дефицита"]
+            : adjusted
+              ? ["purple", "Спрос скорректирован"]
+              : line.order_quantity > 0
+                ? ["purple", "К закупке"]
+                : ["green", "Запас в норме"];
+        return `<tr><td><div class="product-cell"><span class="product-icon">${icon("box")}</span><div><div class="product-name">${escapeHTML(line.name)}</div><div class="product-sku">${escapeHTML(line.sku)}${line.internal_code ? ` · 1С: ${escapeHTML(line.internal_code)}` : ""}${line.unit ? ` · ${escapeHTML(line.unit)}` : ""}</div></div></div></td><td>${escapeHTML(supplierMap.get(line.supplier_id))}</td><td class="numeric">${number(line.forecast_demand, 1)}</td><td class="numeric">${number(line.available_stock)}</td><td class="numeric">${number(line.incoming_quantity)}</td><td class="order-quantity numeric">${line.order_quantity ? number(line.order_quantity) : "—"}</td><td><span class="badge ${status[0]}">${status[1]}</span></td><td><details><summary>Обоснование</summary><p>${escapeHTML(line.explanation || "")}</p></details><button class="row-detail" data-detail="${escapeHTML(line.product_id)}" aria-label="Расчёт для ${escapeHTML(line.name)}">${icon("chevron")}</button></td></tr>`;
       })
       .join("")}</tbody></table></div>`;
 }
 
 function renderShipments(supplierMap) {
+  $("#pagination").hidden = true;
   const products = new Map(
     (state.snapshot?.data.products || []).map((p) => [p.id, p]),
   );
@@ -426,7 +489,9 @@ function renderShipments(supplierMap) {
       return (
         p &&
         (!state.supplier || p.supplier_id === state.supplier) &&
-        `${p.name} ${p.sku}`.toLocaleLowerCase("ru-RU").includes(state.search)
+        `${p.name} ${p.sku} ${p.internal_code || ""}`
+          .toLocaleLowerCase("ru-RU")
+          .includes(state.search)
       );
     })
     .sort((a, b) => a.expected_date.localeCompare(b.expected_date));
@@ -447,6 +512,26 @@ function renderShipments(supplierMap) {
 }
 
 function render() {
+  const source = state.snapshot?.data.source;
+  const blocked = (state.result?.products || []).filter(
+    (p) => p.blocked,
+  ).length;
+  $("#source-notice").hidden = !source?.label && !blocked;
+  $("#source-notice").innerHTML =
+    `<strong>${escapeHTML(source?.label || "Проверка данных")}</strong>${source?.as_of ? ` · Источники на ${date(source.as_of)}` : ""}<p>${blocked ? `${blocked} товаров требуют проверки и исключены из экспорта. ` : ""}Месячные отчёты сверены с операциями; для спроса используются дневные продажи.</p>${(
+      source?.warnings || []
+    )
+      .filter(
+        (w) =>
+          !w.startsWith("Подтвердите сроки") ||
+          state.snapshot.data.suppliers.some(
+            (supplier) => supplier.lead_time_unconfirmed,
+          ),
+      )
+      .map((w) => `<p>${escapeHTML(w)}</p>`)
+      .join(
+        "",
+      )}<button class="text-button" data-action="settings">Настроить сроки поставки</button>`;
   $("#planning-date").textContent = date(state.params.as_of);
   $("#history-label").textContent = `${state.params.lookback_days} дней`;
   $("#overview-section").hidden = state.view !== "overview";
@@ -511,12 +596,24 @@ function render() {
   busy(state.busy);
 }
 
-function openModal(title, body) {
+function resetImport() {
+  importRequest += 1;
+  if (xlsxImport?.converting) {
+    xlsxImport.controller.abort();
+    busy(false);
+  }
+  xlsxImport = null;
+  state.pendingImport = null;
+}
+
+function openModal(title, body, preserveImport = false) {
+  if (!preserveImport) resetImport();
   $("#modal-title").textContent = title;
   $("#modal-body").innerHTML = body;
   if (!$("#modal").open) $("#modal").showModal();
 }
 function closeModal() {
+  resetImport();
   $("#modal").close();
 }
 function modalError(error) {
@@ -529,12 +626,14 @@ function modalError(error) {
     $("#modal-body").append(el);
   }
   el.textContent = error.message;
+  el.tabIndex = -1;
+  el.focus();
 }
 
 function settings() {
   openModal(
     "Параметры расчёта",
-    `<p class="modal-copy">Настройте период анализа и запас. Продажи за дату расчёта не учитываются, поскольку день ещё может быть неполным.</p><form id="settings-form"><div class="form-grid"><label class="field full">Дата расчёта<input name="as_of" type="date" value="${state.params.as_of}" min="1900-01-01" max="9990-12-31" required></label><label class="field">История продаж, дней<input name="lookback_days" type="number" min="7" max="730" step="1" value="${state.params.lookback_days}" required></label><label class="field">Период закупки, дней<input name="review_period_days" type="number" min="1" max="365" step="1" value="${state.params.review_period_days}" required></label><label class="field full">Страховой запас, дней<input name="safety_stock_days" type="number" min="0" max="365" step="1" value="${state.params.safety_stock_days}" required><small>Добавляется к сроку поставки и периоду закупки.</small></label></div><div class="modal-actions"><button class="button secondary" type="button" data-action="close-modal">Отмена</button><button class="button primary" type="submit">Применить и рассчитать</button></div></form>`,
+    `<p class="modal-copy">Настройте период анализа и запас. Продажи за дату расчёта не учитываются, поскольку день ещё может быть неполным.</p><form id="settings-form"><div class="form-grid"><label class="field full">Дата расчёта<input name="as_of" type="date" value="${state.params.as_of}" min="1900-01-01" max="9990-12-31" required></label><label class="field">История продаж, дней<input name="lookback_days" type="number" min="7" max="730" step="1" value="${state.params.lookback_days}" required></label><label class="field">Период закупки, дней<input name="review_period_days" type="number" min="1" max="365" step="1" value="${state.params.review_period_days}" required></label><label class="field full">Страховой запас, дней<input name="safety_stock_days" type="number" min="0" max="365" step="1" value="${state.params.safety_stock_days}" required><small>Добавляется к сроку поставки и периоду закупки.</small></label>${(state.snapshot?.data.suppliers || []).map((supplier, index) => `<label class="field full">Срок ${escapeHTML(supplier.name)}, дней<input name="lead-${index}" type="number" min="0" max="365" step="1" value="${supplier.lead_time_unconfirmed ? "" : supplier.lead_time_days}" placeholder="Подтвердите срок нового заказа" required><small>${supplier.lead_time_unconfirmed ? "Не указан в источниках. Введите согласованный срок." : "Срок нового заказа, а не дата уже отгруженной поставки."}</small></label>`).join("")}</div><div class="modal-actions"><button class="button secondary" type="button" data-action="close-modal">Отмена</button><button class="button primary" type="submit">Применить и рассчитать</button></div></form>`,
   );
 }
 
@@ -548,7 +647,7 @@ function connect() {
 function method() {
   openModal(
     "Как работает расчёт",
-    `<p class="modal-copy">Прозрачная рекомендация на основе данных вашего склада.</p><ol class="method-list"><li><strong>Находим регулярный спрос.</strong> Для Excel анализируем полные месяцы; неполный месяц исключаем. Для дневного JSON анализируем полные дни. Пустые ячейки сводных таблиц считаем нулём.</li><li><strong>Убираем разовые всплески.</strong> Сравниваем продажи с медианой и разбросом. При недостатке истории оставляем продажи и показываем предупреждение.</li><li><strong>Учитываем доступный запас.</strong> Вычитаем резервы, добавляем поставки в пределах горизонта. Просроченные поставки исключаем.</li><li><strong>Рассчитываем закупку.</strong> Покрываем срок поставки, период закупки и страховой запас. Округляем заказ до упаковки и минимальной партии.</li></ol><p class="notice">График суммирует базовые единицы разных товаров. Рекомендации рассчитываются отдельно по каждой позиции. Для Excel используем завершённые месяцы, коэффициенты сезонности поставщика и ограниченный тренд 0,75–1,25. При нулевом остатке и низких продажах восстанавливаем вероятный спрос по медиане нормальных месяцев. Это оценка: месячные остатки не показывают точные дни отсутствия. Даты остатков и допущения указаны в обосновании.</p><div class="modal-actions"><button class="button primary" data-action="close-modal">Понятно</button></div>`,
+    `<p class="modal-copy">Прозрачная рекомендация на основе данных вашего склада.</p><ol class="method-list"><li><strong>Находим регулярный спрос.</strong> Для встроенных месячных данных анализируем полные месяцы; неполный месяц исключаем. Для дневных данных JSON и XLSX анализируем полные дни. Пустые ячейки сводных таблиц считаем нулём.</li><li><strong>Убираем разовые всплески.</strong> Сравниваем продажи с медианой и разбросом. При недостатке истории оставляем продажи и показываем предупреждение.</li><li><strong>Учитываем доступный запас.</strong> Вычитаем резервы, добавляем поставки в пределах горизонта. Просроченные поставки исключаем.</li><li><strong>Рассчитываем закупку.</strong> Покрываем срок поставки, период закупки и страховой запас. Округляем заказ до упаковки и минимальной партии.</li></ol><p class="notice">График суммирует базовые единицы разных товаров. Рекомендации рассчитываются отдельно по каждой позиции. Для встроенных месячных данных используем завершённые месяцы, коэффициенты сезонности поставщика и ограниченный тренд 0,75–1,25. При нулевом остатке и низких продажах восстанавливаем вероятный спрос по медиане нормальных месяцев. Это оценка: месячные остатки не показывают точные дни отсутствия. Даты остатков и допущения указаны в обосновании.</p><div class="modal-actions"><button class="button primary" data-action="close-modal">Понятно</button></div>`,
   );
 }
 
@@ -608,6 +707,12 @@ function showDetail(id) {
   const pairs = [
     ["Исходный спрос / день", number(line.raw_daily_demand, 2)],
     ["Регулярный спрос / день", number(line.daily_demand, 2)],
+    [
+      "Прогноз / день",
+      number(line.forecast_daily_demand ?? line.daily_demand, 2),
+    ],
+    ["Поправка сезонности", number(line.seasonal_factor ?? 1, 3)],
+    ["Дата остатка", stock.as_of || product.stock_date ? date(stock.as_of || product.stock_date) : "Не указана"],
     ["Горизонт покрытия", `${line.coverage_days} дн.`],
     ["Целевой запас", number(line.target_stock)],
     [
@@ -628,7 +733,7 @@ function showDetail(id) {
   ];
   openModal(
     line.name,
-    `<p class="modal-copy">${escapeHTML(line.explanation || "")}</p><p class="modal-copy">${escapeHTML(line.sku)} · Покрытие до ${date(line.coverage_end)}</p>${calculationTrace(line, product, stock)}<div class="detail-grid">${pairs.map(([label, value]) => `<div class="detail-item"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div><div class="detail-total"><span>Рекомендовано к закупке</span><strong>${number(line.order_quantity)}</strong></div>${line.adjustments.length ? `<h3 class="detail-subtitle">Корректировки продаж</h3>${line.adjustments.map((a) => `<div class="adjustment-row"><span>${date(a.date)} · ${a.reason === "sales_spike" ? "Всплеск" : a.reason === "stockout_compensation" ? "Вероятное отсутствие товара" : "Ручное исключение"}</span><strong>${number(a.original_quantity)} → ${number(a.used_quantity, 1)}</strong></div>`).join("")}` : ""}${line.warnings.length ? `<h3 class="detail-subtitle">Обратите внимание</h3><ul class="warning-list">${line.warnings.map((w) => `<li>${escapeHTML(warningLabels[w] || w)}</li>`).join("")}</ul>` : ""}<div class="modal-actions"><button class="button primary" data-action="close-modal">Готово</button></div>`,
+    `<p class="modal-copy">${escapeHTML(line.explanation || "")}</p><p class="modal-copy">${escapeHTML(line.sku)} · Покрытие до ${date(line.coverage_end)}</p>${calculationTrace(line, product, stock)}<div class="detail-grid">${pairs.map(([label, value]) => `<div class="detail-item"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div><div class="detail-total"><span>${line.blocked ? "Черновик · нужна проверка" : "Рекомендовано к закупке"}</span><strong>${number(line.blocked ? line.suggested_quantity : line.order_quantity)}</strong></div>${line.adjustments.length ? `<h3 class="detail-subtitle">Корректировки продаж</h3>${line.adjustments.map((a) => `<div class="adjustment-row"><span>${date(a.date)} · ${a.reason === "sales_spike" ? "Всплеск" : a.reason === "stockout_compensation" ? "Вероятное отсутствие товара" : a.reason === "net_returns" ? "Возврат" : "Ручное исключение"}</span><strong>${number(a.original_quantity)} → ${number(a.used_quantity, 1)}</strong></div>`).join("")}` : ""}${line.warnings.length ? `<h3 class="detail-subtitle">Обратите внимание</h3><ul class="warning-list">${line.warnings.map((w) => `<li>${escapeHTML(warningLabels[w] || w)}</li>`).join("")}</ul>` : ""}<div class="modal-actions"><button class="button primary" data-action="close-modal">Готово</button></div>`,
   );
 }
 
@@ -745,6 +850,79 @@ function demoDataset() {
   return data;
 }
 
+function xlsxImportForm() {
+  if (!xlsxImport) return;
+  const { files, asOf, historyStart } = xlsxImport;
+  state.pendingImport = null;
+  openModal(
+    "Загрузка файлов Excel",
+    `<p class="modal-copy">Добавьте полный комплект из шести отчётов для ИЭК, Systeme Electric или обоих поставщиков. Можно выбирать файлы по очереди из разных папок, сохраняя исходные имена.</p><p class="notice">Для каждого поставщика нужны дневные продажи, месячные продажи, месячные остатки, товары в пути, минимальная партия или кратность заказа и сезонность. Файл минимальной партии ИЭК добавьте отдельно, если он лежит вне папки поставщика.</p><form id="xlsx-import-form"><div class="import-files-heading"><strong>Выбрано файлов: ${files.length} из 12</strong><button class="button secondary" type="button" data-action="add-import-files">${icon("upload")}Добавить файлы</button></div><ul class="import-files" id="xlsx-file-list">${files.length ? files.map((file, index) => `<li><span><strong>${escapeHTML(file.name)}</strong><small>${number(file.size / 1024 / 1024)} МБ</small></span><button class="icon-button" type="button" data-remove-import-file="${index}" aria-label="Удалить ${escapeHTML(file.name)}">${icon("close")}</button></li>`).join("") : '<li class="muted">Добавьте отчёты в формате .xlsx.</li>'}</ul><p class="import-size muted">Общий размер: ${number(files.reduce((sum, file) => sum + file.size, 0) / 1024 / 1024)} МБ из 64 МБ</p><div class="form-grid"><label class="field">Дата выгрузки<input name="as_of" type="date" value="${escapeHTML(asOf)}" min="1900-01-01" max="9990-12-31" required><small>Дата, на которую собраны отчёты. Должна совпадать с датой в именах файлов.</small></label><label class="field">Начало истории продаж<input name="history_start" type="date" value="${escapeHTML(historyStart)}" min="1900-01-01" max="${escapeHTML(asOf || "9990-12-31")}" required><small>Первый день полного периода выгрузки, включая дни без продаж.</small></label></div><p class="modal-copy import-help">После проверки вы увидите состав данных и предупреждения. Сохранение потребует отдельного подтверждения. Резервную копию JSON можно загрузить одним файлом.</p><p id="xlsx-import-status" class="import-progress" role="status" hidden><span class="spinner"></span>Читаем отчёты и проверяем данные…</p><div class="modal-actions"><button class="button secondary" type="button" data-action="close-modal">Отмена</button><button class="button primary" id="convert-xlsx" type="submit" ${files.length ? "" : "disabled"}>Проверить файлы</button></div></form>`,
+    true,
+  );
+}
+
+function rememberXlsxDates() {
+  const form = $("#xlsx-import-form");
+  if (!xlsxImport || !form) return;
+  const fields = new FormData(form);
+  xlsxImport.asOf = fields.get("as_of");
+  xlsxImport.historyStart = fields.get("history_start");
+}
+
+async function convertXlsx(form) {
+  if (state.busy || !xlsxImport || !form.reportValidity()) return;
+  rememberXlsxDates();
+  const current = xlsxImport;
+  if (!current.files.length) {
+    modalError(new Error("Добавьте отчёты в формате .xlsx."));
+    return;
+  }
+  if (current.historyStart > current.asOf) {
+    modalError(new Error("Начало истории не может быть позже даты выгрузки."));
+    return;
+  }
+  const body = new FormData();
+  current.files.forEach((file) => body.append("files", file));
+  body.append("as_of", current.asOf);
+  body.append("history_start", current.historyStart);
+  current.controller = new AbortController();
+  current.converting = true;
+  busy(true);
+  $("#modal-error")?.remove();
+  form.setAttribute("aria-busy", "true");
+  form
+    .querySelectorAll("input, button:not([data-action='close-modal'])")
+    .forEach((el) => {
+      el.disabled = true;
+    });
+  $("#xlsx-import-status").hidden = false;
+  try {
+    const response = await api("import/xlsx", {
+      method: "POST",
+      body,
+      timeout: 120000,
+      signal: current.controller.signal,
+    });
+    const converted = await response.json();
+    if (xlsxImport !== current || !$("#modal").open) return;
+    importPreview(converted.data, `Excel · ${current.files.length} файлов`);
+  } catch (error) {
+    if (xlsxImport === current && $("#modal").open) modalError(error);
+  } finally {
+    if (xlsxImport === current) {
+      current.converting = false;
+      busy(false);
+      if ($("#xlsx-import-form") === form) {
+        form.setAttribute("aria-busy", "false");
+        form.querySelectorAll("input, button").forEach((el) => {
+          el.disabled = false;
+        });
+        $("#xlsx-import-status").hidden = true;
+      }
+    }
+  }
+}
+
 function importPreview(data, name, demo = false) {
   if (
     !data ||
@@ -755,6 +933,7 @@ function importPreview(data, name, demo = false) {
     throw new Error(
       "Файл должен содержать массивы suppliers, products, sales, stock и shipments.",
     );
+  if (demo) resetImport();
   state.pendingImport = { data, etag: state.etag, demo };
   openModal(
     demo ? "Попробуйте на примере склада" : "Проверка перед загрузкой",
@@ -769,7 +948,8 @@ function importPreview(data, name, demo = false) {
       )
       .join(
         "",
-      )}</div><p class="notice">${state.snapshot?.data.products.length ? "Загрузка полностью заменит текущие данные склада. Сначала сохраните резервную копию, если хотите вернуться к ним." : "Данные будут сохранены в рабочее пространство. Рекомендации не отправляются поставщикам автоматически."}</p><div class="modal-actions">${state.snapshot?.revision ? '<button class="button secondary" data-action="backup">Скачать текущие данные</button>' : ""}<button class="button primary" id="confirm-import" data-action="confirm-import">${demo ? "Загрузить демоданные" : "Заменить данные"}</button></div>`,
+      )}</div>${data.source?.warnings?.length ? `<div class="notice import-warnings"><strong>Проверка источников</strong><ul>${data.source.warnings.map((warning) => `<li>${escapeHTML(warning)}</li>`).join("")}</ul></div>` : ""}<p class="notice">${state.snapshot?.data.products.length ? "Загрузка полностью заменит текущие данные склада. Сначала сохраните резервную копию, если хотите вернуться к ним." : "Данные будут сохранены в рабочее пространство. Рекомендации не отправляются поставщикам автоматически."}</p><div class="modal-actions">${xlsxImport ? '<button class="button secondary" data-action="back-import-files">Назад к файлам</button>' : ""}${state.snapshot?.revision ? '<button class="button secondary" data-action="backup">Скачать текущие данные</button>' : ""}<button class="button primary" id="confirm-import" data-action="confirm-import">${demo ? "Загрузить демоданные" : "Заменить данные"}</button></div>`,
+    true,
   );
 }
 
@@ -798,6 +978,11 @@ async function confirmImport() {
         review_period_days: 14,
         safety_stock_days: 7,
       };
+    if (pending.data.source?.as_of) {
+      state.params.as_of = shiftDate(pending.data.source.as_of, 1);
+      state.filter = "attention";
+    }
+    state.page = 1;
     state.pendingImport = null;
     state.search = "";
     state.supplier = "";
@@ -870,6 +1055,7 @@ async function exportCSV() {
 document.addEventListener("click", async (event) => {
   const view = event.target.closest("[data-view]");
   if (view) {
+    state.page = 1;
     state.view = view.dataset.view;
     state.filter = state.view === "inventory" ? "all" : "needed";
     $("#sidebar").classList.remove("open");
@@ -880,6 +1066,7 @@ document.addEventListener("click", async (event) => {
   }
   const filter = event.target.closest("[data-filter]");
   if (filter) {
+    state.page = 1;
     state.filter = filter.dataset.filter;
     render();
     return;
@@ -889,6 +1076,13 @@ document.addEventListener("click", async (event) => {
     showDetail(detail.dataset.detail);
     return;
   }
+  const removeFile = event.target.closest("[data-remove-import-file]");
+  if (removeFile && xlsxImport && !state.busy) {
+    rememberXlsxDates();
+    xlsxImport.files.splice(Number(removeFile.dataset.removeImportFile), 1);
+    xlsxImportForm();
+    return;
+  }
   const action = event.target.closest("[data-action]")?.dataset.action;
   if (!action) return;
   try {
@@ -896,6 +1090,14 @@ document.addEventListener("click", async (event) => {
       const open = $("#sidebar").classList.toggle("open");
       $(".mobile-menu").setAttribute("aria-expanded", String(open));
       syncSidebar();
+    }
+    if (action === "previous-page") {
+      state.page = Math.max(1, state.page - 1);
+      renderTable();
+    }
+    if (action === "next-page") {
+      state.page += 1;
+      renderTable();
     }
     if (action === "close-modal") closeModal();
     if (action === "connect") connect();
@@ -911,11 +1113,17 @@ document.addEventListener("click", async (event) => {
       const response = await api("excel-dataset");
       importPreview(await response.json(), "12 Excel-файлов IEK и System Electric · 22.09.2026");
     }
+    if (action === "add-import-files" && !state.busy) {
+      rememberXlsxDates();
+      $("#file-input").click();
+    }
+    if (action === "back-import-files" && !state.busy) xlsxImportForm();
     if (action === "import") {
       if (!state.snapshot) {
         connect();
         return;
       }
+      resetImport();
       $("#file-input").click();
     }
     if (action === "demo" && state.snapshot)
@@ -936,18 +1144,59 @@ document.addEventListener("click", async (event) => {
 document.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
+  if (form.id === "xlsx-import-form") await convertXlsx(form);
   if (form.id === "settings-form") {
+    if (state.busy) return;
     const data = new FormData(form);
-    state.params = {
-      as_of: data.get("as_of"),
-      lookback_days: Number(data.get("lookback_days")),
-      review_period_days: Number(data.get("review_period_days")),
-      safety_stock_days: Number(data.get("safety_stock_days")),
-    };
-    state.result = null;
-    closeModal();
-    render();
-    await calculate();
+    const button = form.querySelector("button[type='submit']");
+    button.disabled = true;
+    busy(true);
+    try {
+      if (state.snapshot) {
+        const updated = structuredClone(state.snapshot.data);
+        let changed = false;
+        updated.suppliers.forEach((supplier, index) => {
+          const days = Number(data.get(`lead-${index}`));
+          if (
+            days !== supplier.lead_time_days ||
+            supplier.lead_time_unconfirmed
+          )
+            changed = true;
+          supplier.lead_time_days = days;
+          supplier.lead_time_unconfirmed = false;
+        });
+        if (changed) {
+          const response = await api("dataset", {
+            method: "PUT",
+            headers: { "If-Match": state.etag },
+            body: JSON.stringify(updated),
+          });
+          state.snapshot = await response.json();
+          state.etag = response.headers.get("ETag");
+        }
+      }
+      state.params = {
+        as_of: data.get("as_of"),
+        lookback_days: Number(data.get("lookback_days")),
+        review_period_days: Number(data.get("review_period_days")),
+        safety_stock_days: Number(data.get("safety_stock_days")),
+      };
+      state.result = null;
+      state.page = 1;
+      closeModal();
+      if (state.snapshot?.data.products.length) await getRecommendations();
+      clearError();
+    } catch (error) {
+      if (error.status === 412)
+        error.message =
+          "Данные изменились. Закройте окно, обновите данные и повторите изменение сроков.";
+      if ($("#modal").open) modalError(error);
+      else showError(error);
+    } finally {
+      button.disabled = false;
+      render();
+      busy(false);
+    }
   }
   if (form.id === "connect-form") {
     if (state.busy) return;
@@ -982,33 +1231,95 @@ document.addEventListener("submit", async (event) => {
 });
 
 $("#file-input").addEventListener("change", async (event) => {
-  const file = event.target.files[0];
+  const selected = [...event.target.files];
   event.target.value = "";
-  if (!file) return;
+  if (!selected.length || state.busy) return;
   try {
-    if (file.size > 8 * 1024 * 1024)
+    clearError();
+    if (selected.some((file) => !/\.(json|xlsx)$/i.test(file.name)))
+      throw new Error("Выберите файл JSON или отчёты Excel в формате .xlsx.");
+    const jsonFiles = selected.filter((file) => /\.json$/i.test(file.name));
+    if (jsonFiles.length && (selected.length !== 1 || xlsxImport))
       throw new Error(
-        "Размер файла превышает 8 МБ. Сократите период истории или число записей.",
+        "JSON загружается одним файлом, отдельно от Excel. Закройте это окно и начните новую загрузку для выбора JSON.",
       );
+    if (!jsonFiles.length) {
+      const files = [...(xlsxImport?.files || [])];
+      for (const file of selected) {
+        const existing = files.find((item) => item.name === file.name);
+        if (existing) {
+          if (
+            existing.size === file.size &&
+            existing.lastModified === file.lastModified
+          )
+            continue;
+          throw new Error(
+            `Файл «${file.name}» уже добавлен. Удалите прежний файл перед заменой.`,
+          );
+        }
+        files.push(file);
+      }
+      if (files.length > 12)
+        throw new Error(
+          "Можно загрузить до 12 файлов Excel: по шесть для каждого поставщика.",
+        );
+      if (files.reduce((sum, file) => sum + file.size, 0) > 64 * 1024 * 1024)
+        throw new Error(
+          "Общий размер файлов превышает 64 МБ. Сократите период истории в исходных отчётах.",
+        );
+      if (!xlsxImport) {
+        resetImport();
+        const asOf = shiftDate(state.params.as_of, -1);
+        xlsxImport = {
+          files,
+          asOf,
+          historyStart: `${String(Number(asOf.slice(0, 4)) - 1).padStart(4, "0")}-01-01`,
+          converting: false,
+        };
+      } else {
+        rememberXlsxDates();
+        xlsxImport.files = files;
+      }
+      xlsxImportForm();
+      return;
+    }
+    const file = jsonFiles[0];
+    if (file.size > 64 * 1024 * 1024)
+      throw new Error(
+        "Размер файла превышает 64 МБ. Сократите период истории или число записей.",
+      );
+    resetImport();
+    const request = importRequest;
     let data;
     try {
       data = JSON.parse(await file.text());
     } catch {
+      if (request !== importRequest) return;
       throw new Error("Не удалось прочитать JSON. Проверьте формат файла.");
     }
+    if (request !== importRequest) return;
     importPreview(
-      data.data && Array.isArray(data.data.products) ? data.data : data,
+      data?.data && Array.isArray(data.data.products) ? data.data : data,
       file.name,
     );
   } catch (error) {
-    showError(error);
+    if ($("#modal").open) modalError(error);
+    else showError(error);
+  }
+});
+document.addEventListener("input", (event) => {
+  if (event.target.matches("#xlsx-import-form input[name='as_of']")) {
+    $("#xlsx-import-form input[name='history_start']").max =
+      event.target.value || "9990-12-31";
   }
 });
 $("#search").addEventListener("input", (event) => {
+  state.page = 1;
   state.search = event.target.value.toLocaleLowerCase("ru-RU").trim();
   renderTable();
 });
 $("#supplier-filter").addEventListener("change", (event) => {
+  state.page = 1;
   state.supplier = event.target.value;
   renderTable();
 });
@@ -1020,7 +1331,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 $("#modal").addEventListener("close", () => {
-  state.pendingImport = null;
+  if (!$("#modal").open) resetImport();
 });
 let resizeFrame;
 window.addEventListener("resize", () => {

@@ -14,6 +14,22 @@
   --border: #ececf2;
   --ink: #282735;
 }
+.source-notice {
+  margin-bottom: 20px;
+}
+.source-notice p {
+  margin: 7px 0;
+}
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.product-name {
+  white-space: normal;
+  max-width: 360px;
+  line-height: 1.5;
+}
 * {
   box-sizing: border-box;
 }
@@ -1095,9 +1111,79 @@ dialog::backdrop {
 }
 .modal-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 9px;
   margin-top: 25px;
+}
+.import-files-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 20px;
+  font-size: 12px;
+}
+.import-files {
+  padding: 0;
+  margin: 12px 0 0;
+  list-style: none;
+  max-height: 225px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.import-files li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  font-size: 11px;
+}
+.import-files li + li {
+  border-top: 1px solid var(--border);
+}
+.import-files li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.import-files strong {
+  font-weight: 500;
+}
+.import-files small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+}
+.import-files .icon-button {
+  flex-shrink: 0;
+}
+.import-size {
+  margin: 8px 0 22px;
+  font-size: 11px;
+}
+.import-help {
+  margin: 20px 0 0;
+}
+.import-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  margin-top: 20px;
+}
+.import-progress .spinner {
+  flex-shrink: 0;
+}
+.import-warnings {
+  max-height: 200px;
+  overflow-y: auto;
+}
+.import-warnings ul {
+  padding-left: 18px;
+  margin-bottom: 0;
 }
 .import-summary {
   display: grid;

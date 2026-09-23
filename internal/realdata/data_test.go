@@ -29,7 +29,7 @@ func TestSuppliedExcelSnapshot(t *testing.T) {
 		if s.ProductID == "iek:200400085_" {
 			foundStock = true
 			if s.OnHand != 9084 {
-				t.Fatalf("wrong September stock: %d", s.OnHand)
+				t.Fatalf("wrong September stock: %g", s.OnHand)
 			}
 		}
 	}
@@ -93,10 +93,10 @@ func TestLiveDemoSKUTrace(t *testing.T) {
 		if math.Abs(raw-a.RawTotal) > 1e-8 || math.Abs(spikes-a.AfterSpikesTotal) > 1e-8 || math.Abs(stockouts-a.AfterStockoutsTotal) > 1e-8 {
 			t.Fatal("history does not reconcile with totals")
 		}
-		if int64(math.Ceil(l.ForecastDemand+l.SafetyStock)) != l.TargetStock {
+		if math.Ceil(l.ForecastDemand+l.SafetyStock) != l.TargetStock {
 			t.Fatal("forecast does not reconcile")
 		}
-		t.Logf("raw %.4f -> filtered %.4f -> compensated %.4f; base %.6f trend %.6f season %.6f forecast %.6f safety %.6f target %d stock %d transit %d order %d", a.RawTotal, a.AfterSpikesTotal, a.AfterStockoutsTotal, a.BaseDailyDemand, l.TrendFactor, l.SeasonalityFactor, l.ForecastDemand, l.SafetyStock, l.TargetStock, l.AvailableStock, l.IncomingQuantity, l.OrderQuantity)
+		t.Logf("raw %.4f -> filtered %.4f -> compensated %.4f; base %.6f trend %.6f season %.6f forecast %.6f safety %.6f target %g stock %g transit %g order %g", a.RawTotal, a.AfterSpikesTotal, a.AfterStockoutsTotal, a.BaseDailyDemand, l.TrendFactor, l.SeasonalityFactor, l.ForecastDemand, l.SafetyStock, l.TargetStock, l.AvailableStock, l.IncomingQuantity, l.OrderQuantity)
 		return
 	}
 	t.Fatal("real demo SKU missing")

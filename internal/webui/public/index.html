@@ -212,6 +212,12 @@
             <svg class="icon"><use href="#i-sliders" /></svg>Параметры расчёта
           </button>
         </div>
+        <section
+          id="source-notice"
+          class="notice source-notice"
+          aria-label="Качество исходных данных"
+          hidden
+        ></section>
         <div id="loading" class="loading" role="status" hidden>
           <span class="spinner"></span>Обновляем данные…
         </div>
@@ -318,6 +324,7 @@
           </div>
           <div id="table-content"></div>
           <div class="table-footer">
+            <div id="pagination" class="pagination" hidden></div>
             <span id="result-caption">Загрузите данные для начала работы</span
             ><span class="subtle-note"
               ><span class="status-dot"></span>Решение о заказе остаётся за
@@ -333,7 +340,13 @@
         </footer>
       </main>
     </div>
-    <input type="file" id="file-input" accept=".json,application/json" hidden />
+    <input
+      type="file"
+      id="file-input"
+      accept=".json,.xlsx,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      multiple
+      hidden
+    />
     <dialog id="modal" aria-labelledby="modal-title">
       <div class="modal-header">
         <h2 id="modal-title"></h2>

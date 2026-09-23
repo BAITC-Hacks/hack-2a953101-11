@@ -25,14 +25,15 @@ import (
 const maxBodyBytes = 64 << 20
 
 type API struct {
-	store  *storage.Store
-	logger *slog.Logger
-	apiKey string
-	origin string
+	store       *storage.Store
+	logger      *slog.Logger
+	apiKey      string
+	origin      string
+	importSlots chan struct{}
 }
 
 func New(store *storage.Store, logger *slog.Logger, apiKey, allowedOrigin string) http.Handler {
-	a := &API{store: store, logger: logger, apiKey: apiKey, origin: allowedOrigin}
+	a := &API{store: store, logger: logger, apiKey: apiKey, origin: allowedOrigin, importSlots: make(chan struct{}, 1)}
 	mux := http.NewServeMux()
 	webui.Register(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
@@ -47,6 +48,7 @@ func New(store *storage.Store, logger *slog.Logger, apiKey, allowedOrigin string
 		writeJSON(w, 200, d)
 	})
 	mux.HandleFunc("PUT /api/v1/dataset", a.putDataset)
+	mux.HandleFunc("POST /api/v1/import/xlsx", a.importXLSX)
 	mux.HandleFunc("POST /api/v1/recommendations", a.recommend)
 	mux.HandleFunc("POST /api/v1/recommendations.csv", a.recommend)
 	return a.middleware(mux)
@@ -173,11 +175,11 @@ func (a *API) recommend(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(r.URL.Path, ".csv") {
 		var body bytes.Buffer
 		writer := csv.NewWriter(&body)
-		_ = writer.Write([]string{"supplier_id", "supplier_name", "product_id", "sku", "product_name", "quantity", "expected_date", "daily_demand", "available_stock", "incoming_quantity", "forecast_demand", "safety_stock", "explanation"})
+		_ = writer.Write([]string{"supplier_id", "supplier_name", "product_id", "sku", "product_name", "quantity", "expected_date", "daily_demand", "available_stock", "incoming_quantity", "internal_code", "unit", "forecast_daily_demand", "seasonal_factor", "forecast_demand", "safety_stock", "explanation"})
 		for _, order := range result.Orders {
 			for _, line := range order.Lines {
 				_ = writer.Write([]string{safeCell(order.SupplierID), safeCell(order.SupplierName), safeCell(line.ProductID), safeCell(line.SKU), safeCell(line.Name),
-					strconv.FormatInt(line.OrderQuantity, 10), order.ExpectedDate, strconv.FormatFloat(line.DailyDemand, 'f', 6, 64), strconv.FormatInt(line.AvailableStock, 10), strconv.FormatInt(line.IncomingQuantity, 10), strconv.FormatFloat(line.ForecastDemand, 'f', 2, 64), strconv.FormatFloat(line.SafetyStock, 'f', 2, 64), safeCell(line.Explanation)})
+					strconv.FormatFloat(line.OrderQuantity, 'f', -1, 64), order.ExpectedDate, strconv.FormatFloat(line.DailyDemand, 'f', 6, 64), strconv.FormatFloat(line.AvailableStock, 'f', -1, 64), strconv.FormatFloat(line.IncomingQuantity, 'f', -1, 64), safeCell(line.InternalCode), safeCell(line.Unit), strconv.FormatFloat(line.ForecastDailyDemand, 'f', 6, 64), strconv.FormatFloat(line.SeasonalFactor, 'f', 6, 64), strconv.FormatFloat(line.ForecastDemand, 'f', 2, 64), strconv.FormatFloat(line.SafetyStock, 'f', 2, 64), safeCell(line.Explanation)})
 			}
 		}
 		writer.Flush()

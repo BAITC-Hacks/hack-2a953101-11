@@ -20,11 +20,15 @@ func TestPersistenceAndIsolation(t *testing.T) {
 	}
 	d := planning.EmptyDataset()
 	d.Suppliers = append(d.Suppliers, planning.Supplier{ID: "s", Name: "Supplier"})
+	d.Suppliers[0].Seasonality = []float64{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	d.Source.Warnings = []string{"original"}
 	saved, err := s.Replace(context.Background(), d, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	d.Suppliers[0].Name = "input mutation"
+	d.Suppliers[0].Seasonality[0] = 9
+	saved.Data.Source.Warnings[0] = "output mutation"
 	saved.Data.Suppliers[0].Name = "output mutation"
 	snapshot := s.Read()
 	snapshot.Data.Suppliers[0].Name = "read mutation"
@@ -33,6 +37,9 @@ func TestPersistenceAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, current := range []*Store{s, reopened} {
+		if got := current.Read(); got.Data.Suppliers[0].Seasonality[0] != 1 || got.Data.Source.Warnings[0] != "original" {
+			t.Fatal("nested import metadata was mutated")
+		}
 		if got := current.Read(); got.Revision != 1 || got.Data.Suppliers[0].Name != "Supplier" {
 			t.Fatalf("snapshot corrupted: %+v", got)
 		}

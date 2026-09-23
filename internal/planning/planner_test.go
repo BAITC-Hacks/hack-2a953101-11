@@ -25,7 +25,7 @@ func TestCalculation(t *testing.T) {
 		name        string
 		mutate      func(*Dataset)
 		demand      float64
-		quantity    int64
+		quantity    float64
 		adjustments int
 	}{
 		{"regular demand", func(d *Dataset) {}, 10, 54, 0},
@@ -54,7 +54,7 @@ func TestCalculation(t *testing.T) {
 			}
 			line := result.Products[0]
 			if math.Abs(line.DailyDemand-tc.demand) > 1e-9 || line.OrderQuantity != tc.quantity || len(line.Adjustments) != tc.adjustments {
-				t.Fatalf("got %+v; want demand %v, quantity %d, adjustments %d", line, tc.demand, tc.quantity, tc.adjustments)
+				t.Fatalf("got %+v; want demand %v, quantity %g, adjustments %d", line, tc.demand, tc.quantity, tc.adjustments)
 			}
 			if tc.quantity == 0 && len(result.Orders) != 0 {
 				t.Fatal("zero-quantity order generated")
@@ -109,7 +109,7 @@ func TestValidation(t *testing.T) {
 		{"missing stock", func(d *Dataset) { d.Stock = []Stock{} }},
 		{"duplicate product", func(d *Dataset) { d.Products = append(d.Products, d.Products[0]) }},
 		{"duplicate day", func(d *Dataset) { d.Sales = append(d.Sales, d.Sales[0]) }},
-		{"negative sale", func(d *Dataset) { d.Sales[0].Quantity = -1 }},
+		{"nonfinite sale", func(d *Dataset) { d.Sales[0].Quantity = math.NaN() }},
 		{"bad date", func(d *Dataset) { d.Sales[0].Date = "2026-02-30" }},
 		{"unrecognized product", func(d *Dataset) { d.Sales[0].ProductID = "missing" }},
 		{"invalid pack", func(d *Dataset) { d.Products[0].PackSize = 0 }},

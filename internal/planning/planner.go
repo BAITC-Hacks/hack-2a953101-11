@@ -33,7 +33,7 @@ func (r Request) Validate() error {
 
 type Adjustment struct {
 	Date             string  `json:"date"`
-	OriginalQuantity int64   `json:"original_quantity"`
+	OriginalQuantity float64 `json:"original_quantity"`
 	UsedQuantity     float64 `json:"used_quantity"`
 	Reason           string  `json:"reason"`
 }
@@ -64,30 +64,36 @@ type Line struct {
 	SeasonalityFactor float64 `json:"seasonality_factor"`
 	Explanation       string  `json:"explanation"`
 
-	ProductID        string       `json:"product_id"`
-	SKU              string       `json:"sku"`
-	Name             string       `json:"name"`
-	SupplierID       string       `json:"supplier_id"`
-	RawDemand        float64      `json:"raw_daily_demand"`
-	DailyDemand      float64      `json:"daily_demand"`
-	CoverageDays     int          `json:"coverage_days"`
-	CoverageEnd      string       `json:"coverage_end"`
-	AvailableStock   int64        `json:"available_stock"`
-	IncomingQuantity int64        `json:"incoming_quantity"`
-	OverdueQuantity  int64        `json:"overdue_quantity"`
-	TargetStock      int64        `json:"target_stock"`
-	NetRequirement   int64        `json:"net_requirement"`
-	OrderQuantity    int64        `json:"order_quantity"`
-	Adjustments      []Adjustment `json:"adjustments"`
-	Warnings         []string     `json:"warnings"`
+	ProductID           string       `json:"product_id"`
+	SKU                 string       `json:"sku"`
+	Name                string       `json:"name"`
+	SupplierID          string       `json:"supplier_id"`
+	RawDemand           float64      `json:"raw_daily_demand"`
+	DailyDemand         float64      `json:"daily_demand"`
+	CoverageDays        int          `json:"coverage_days"`
+	CoverageEnd         string       `json:"coverage_end"`
+	AvailableStock      float64      `json:"available_stock"`
+	IncomingQuantity    float64      `json:"incoming_quantity"`
+	OverdueQuantity     float64      `json:"overdue_quantity"`
+	TargetStock         float64      `json:"target_stock"`
+	NetRequirement      float64      `json:"net_requirement"`
+	OrderQuantity       float64      `json:"order_quantity"`
+	Adjustments         []Adjustment `json:"adjustments"`
+	Warnings            []string     `json:"warnings"`
+	InternalCode        string       `json:"internal_code,omitempty"`
+	Unit                string       `json:"unit,omitempty"`
+	ForecastDailyDemand float64      `json:"forecast_daily_demand"`
+	SeasonalFactor      float64      `json:"seasonal_factor"`
+	Blocked             bool         `json:"blocked"`
+	SuggestedQuantity   float64      `json:"suggested_quantity"`
 }
 
 type Order struct {
-	SupplierID    string `json:"supplier_id"`
-	SupplierName  string `json:"supplier_name"`
-	ExpectedDate  string `json:"expected_date"`
-	TotalQuantity int64  `json:"total_quantity"`
-	Lines         []Line `json:"lines"`
+	SupplierID    string  `json:"supplier_id"`
+	SupplierName  string  `json:"supplier_name"`
+	ExpectedDate  string  `json:"expected_date"`
+	TotalQuantity float64 `json:"total_quantity"`
+	Lines         []Line  `json:"lines"`
 }
 
 type Result struct {
@@ -119,10 +125,23 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 	}
 	asOf, _ := ParseDate(r.AsOf)
 	start := asOf.AddDate(0, 0, -r.LookbackDays).Format(DateLayout)
-	out := Result{Parameters: r, HistoryStart: start, HistoryEndExclusive: r.AsOf, Orders: []Order{}, Products: []Line{}}
+	historyEnd := r.AsOf
+	if d.Source.HistoryStart > start {
+		start = d.Source.HistoryStart
+	}
+	if d.Source.HistoryEnd != "" {
+		last, _ := ParseDate(d.Source.HistoryEnd)
+		if last.AddDate(0, 0, 1).Format(DateLayout) < historyEnd {
+			historyEnd = last.AddDate(0, 0, 1).Format(DateLayout)
+		}
+	}
+	historyStartTime, _ := ParseDate(start)
+	historyEndTime, _ := ParseDate(historyEnd)
+	historyDays := max(0, int(historyEndTime.Sub(historyStartTime).Hours()/24))
+	out := Result{Parameters: r, HistoryStart: start, HistoryEndExclusive: historyEnd, Orders: []Order{}, Products: []Line{}}
 	sales := map[string][]Sale{}
 	for _, s := range d.Sales {
-		if s.Date >= start && s.Date < r.AsOf {
+		if s.Date >= start && s.Date < historyEnd {
 			sales[s.ProductID] = append(sales[s.ProductID], s)
 		}
 	}
@@ -167,6 +186,27 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 		end := asOf.AddDate(0, 0, coverage).Format(DateLayout)
 		line := Line{ProductID: p.ID, SKU: p.SKU, Name: p.Name, SupplierID: p.SupplierID, CoverageDays: coverage, CoverageEnd: end,
 			AvailableStock: stock[p.ID].OnHand - stock[p.ID].Reserved, Adjustments: []Adjustment{}, Warnings: []string{}}
+		line.InternalCode, line.Unit = p.InternalCode, p.Unit
+		line.SeasonalFactor = 1
+		block := func(reason string) { line.Blocked = true; line.Warnings = append(line.Warnings, reason) }
+		for _, reason := range p.ReviewReasons {
+			block(reason)
+		}
+		if supplier.LeadTimeUnconfirmed {
+			block("lead_time_unconfirmed")
+		}
+		if stock[p.ID].Unverified {
+			block("stock_unverified")
+		}
+		if stamp := stock[p.ID].AsOf; stamp != "" && (stamp < asOf.AddDate(0, 0, -1).Format(DateLayout) || stamp > r.AsOf) {
+			block("stock_snapshot_outdated")
+		}
+		if historyDays == 0 {
+			block("history_unavailable")
+		}
+		if historyDays < r.LookbackDays {
+			line.Warnings = append(line.Warnings, "incomplete_sales_window")
+		}
 		days := sales[p.ID]
 		sort.Slice(days, func(i, j int) bool { return days[i].Date < days[j].Date })
 		positive := []float64{}
@@ -183,31 +223,52 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 				deviations[i] = math.Abs(v - baseline)
 			}
 			threshold = math.Max(3*baseline, baseline+3*1.4826*median(deviations))
-		} else {
+		} else if len(d.Monthly) == 0 {
 			line.Warnings = append(line.Warnings, "insufficient_positive_days_for_spike_detection")
 		}
-		var raw, adjusted float64
+		var raw, adjusted, deseasonalized float64
 		for _, s := range days {
 			quantity := float64(s.Quantity)
 			raw += quantity
 			reason := ""
-			if s.ExcludeFromDemand {
+			if quantity < 0 {
+				quantity, reason = 0, "net_returns"
+			} else if s.ExcludeFromDemand {
 				quantity, reason = 0, "manual_exclusion"
 			} else if quantity > threshold {
 				quantity, reason = baseline, "sales_spike"
 			}
 			adjusted += quantity
+			factor := 1.0
+			if len(supplier.Seasonality) > 0 {
+				day, _ := ParseDate(s.Date)
+				factor = supplier.Seasonality[int(day.Month())-1]
+			}
+			deseasonalized += quantity / factor
 			if reason != "" {
 				line.Adjustments = append(line.Adjustments, Adjustment{s.Date, s.Quantity, quantity, reason})
 			}
 		}
-		line.RawDemand, line.DailyDemand = raw/float64(r.LookbackDays), adjusted/float64(r.LookbackDays)
-		if adjusted == 0 {
-			line.Warnings = append(line.Warnings, "no_regular_demand")
+		denominator := float64(max(1, historyDays))
+		line.RawDemand, line.DailyDemand = raw/denominator, adjusted/denominator
+		line.ForecastDailyDemand = line.DailyDemand
+		if len(supplier.Seasonality) > 0 {
+			factorSum := 0.0
+			for day := 0; day < coverage; day++ {
+				factorSum += supplier.Seasonality[int(asOf.AddDate(0, 0, day).Month())-1]
+			}
+			line.ForecastDailyDemand = deseasonalized / denominator * factorSum / float64(coverage)
+			if line.DailyDemand > 0 {
+				line.SeasonalFactor = line.ForecastDailyDemand / line.DailyDemand
+			}
 		}
 		if len(d.Monthly) > 0 {
+			// Monthly totals are authoritative; daily adjustments must not be
+			// reported again alongside the monthly audit.
+			line.Adjustments = []Adjustment{}
 			monthlyDemand(monthly[p.ID], seasonal[p.SupplierID], asOf, r, &line)
-			adjusted = line.DailyDemand * float64(r.LookbackDays)
+			line.ForecastDailyDemand = line.DailyDemand
+			line.SeasonalFactor = line.SeasonalityFactor
 			if p.Notes != "" {
 				line.Warnings = append(line.Warnings, p.Notes)
 			}
@@ -215,12 +276,12 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 				line.Warnings = append(line.Warnings, "Остаток датирован "+p.StockDate+"; выбранная дата не восстанавливает движение склада.")
 			}
 		} else {
-			line.ForecastDemand = line.DailyDemand * float64(coverage-r.SafetyStockDays)
-			line.SafetyStock = line.DailyDemand * float64(r.SafetyStockDays)
+			line.ForecastDemand = line.ForecastDailyDemand * float64(coverage-r.SafetyStockDays)
+			line.SafetyStock = line.ForecastDailyDemand * float64(r.SafetyStockDays)
 			line.TrendFactor = 1
-			line.SeasonalityFactor = 1
+			line.SeasonalityFactor = line.SeasonalFactor
 		}
-		var arrivingDuringLead int64
+		var arrivingDuringLead float64
 		arrival := asOf.AddDate(0, 0, supplier.LeadTimeDays).Format(DateLayout)
 		for _, s := range shipments[p.ID] {
 			if s.ExpectedDate < r.AsOf {
@@ -235,18 +296,32 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 		if line.OverdueQuantity > 0 {
 			line.Warnings = append(line.Warnings, "overdue_shipments_excluded")
 		}
-		if float64(line.AvailableStock+arrivingDuringLead) < line.DailyDemand*float64(supplier.LeadTimeDays) {
+		if float64(line.AvailableStock+arrivingDuringLead) < line.ForecastDailyDemand*float64(supplier.LeadTimeDays) {
 			line.Warnings = append(line.Warnings, "insufficient_supply_during_lead_time")
 		}
 		// Multiply before dividing to avoid rounding an exact integer upward due
 		// to floating-point error in the displayed daily average.
-		line.TargetStock = int64(math.Ceil(adjusted * float64(coverage) / float64(r.LookbackDays)))
-		line.NetRequirement = max(int64(0), line.TargetStock-line.AvailableStock-line.IncomingQuantity)
+		line.TargetStock = math.Ceil(adjusted * float64(coverage) / denominator)
+		if len(supplier.Seasonality) > 0 {
+			line.TargetStock = math.Ceil(line.ForecastDailyDemand*float64(coverage) - 1e-9)
+		}
+		if len(d.Monthly) > 0 {
+			line.TargetStock = math.Ceil(line.ForecastDemand + line.SafetyStock)
+		}
+		if line.DailyDemand == 0 {
+			line.Warnings = append(line.Warnings, "no_regular_demand")
+		}
+		line.NetRequirement = max(float64(0), line.TargetStock-line.AvailableStock-line.IncomingQuantity)
 		if line.NetRequirement > 0 {
 			quantity := max(line.NetRequirement, p.MinOrderQuantity)
-			line.OrderQuantity = ((quantity + p.PackSize - 1) / p.PackSize) * p.PackSize
+			line.OrderQuantity = math.Ceil(quantity/p.PackSize-1e-9) * p.PackSize
+			line.OrderQuantity = math.Round(line.OrderQuantity*1e6) / 1e6
+			line.SuggestedQuantity = line.OrderQuantity
+			if line.Blocked {
+				line.OrderQuantity = 0
+			}
 		}
-		line.Explanation = fmt.Sprintf("Рекомендовано: %d ед. Прогноз спроса: %.1f; страховой запас: %.1f; доступный остаток: %d; учтено в пути: %d. Минимум: %d; округление до кратности %d. Сезонный коэффициент горизонта: %.3f; тренд: %.3f.", line.OrderQuantity, line.ForecastDemand, line.SafetyStock, line.AvailableStock, line.IncomingQuantity, p.MinOrderQuantity, p.PackSize, line.SeasonalityFactor, line.TrendFactor)
+		line.Explanation = fmt.Sprintf("Рекомендовано: %g ед. Прогноз спроса: %.1f; страховой запас: %.1f; доступный остаток: %g; учтено в пути: %g. Минимум: %g; округление до кратности %g. Сезонный коэффициент горизонта: %.3f; тренд: %.3f.", line.OrderQuantity, line.ForecastDemand, line.SafetyStock, line.AvailableStock, line.IncomingQuantity, p.MinOrderQuantity, p.PackSize, line.SeasonalityFactor, line.TrendFactor)
 		if line.Audit != nil {
 			a := line.Audit
 			line.Explanation = fmt.Sprintf("Продажи за %d дней полных месяцев: %.2f → после всплесков %.2f → после компенсации отсутствия %.2f. Базовый спрос без сезонности: %.4f ед./день; после тренда: %.4f. ", a.HistoryDays, a.RawTotal, a.AfterSpikesTotal, a.AfterStockoutsTotal, a.BaseDailyDemand, a.TrendDailyDemand) + line.Explanation

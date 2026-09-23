@@ -3,6 +3,7 @@ package planning
 import (
 	"context"
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -38,7 +39,7 @@ func TestMonthlySeasonStockoutSpikeAndRounding(t *testing.T) {
 		t.Fatal(err)
 	}
 	l := result.Products[0]
-	if l.IncomingQuantity != 30 || l.OrderQuantity%20 != 0 || l.ForecastDemand < 400 || l.ForecastDemand > 700 || l.Explanation == "" {
+	if l.IncomingQuantity != 30 || math.Mod(l.OrderQuantity, 20) != 0 || l.ForecastDemand < 400 || l.ForecastDemand > 700 || l.Explanation == "" {
 		t.Fatalf("bad line: %+v", l)
 	}
 	found := map[string]bool{}
@@ -58,5 +59,33 @@ func TestMonthlySeasonStockoutSpikeAndRounding(t *testing.T) {
 	}
 	if other.Products[0].NetRequirement-l.NetRequirement != 30 {
 		t.Fatal("transit not subtracted")
+	}
+}
+
+func TestMonthlyForecastRetainsSupplierChecksAndFractionalStock(t *testing.T) {
+	d := fixture()
+	d.Sales[0].Quantity = 1000 // Daily spikes must not duplicate the monthly audit.
+	d.Monthly = []Monthly{{ProductID: "p", Date: "2026-08-01", Quantity: 310}}
+	d.Products[0].PackSize = 0.5
+	d.Products[0].MinOrderQuantity = 0
+	d.Stock[0].OnHand = 10.25
+	d.Stock[0].Reserved = 0
+	r := Request{"2026-09-08", 60, 2, 1}
+	result, err := Calculate(context.Background(), d, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := result.Products[0]
+	if l.ForecastDemand != 50 || l.ForecastDailyDemand != 10 || l.SafetyStock != 10 || l.TargetStock != 60 || l.OrderQuantity != 50 || len(l.Adjustments) != 0 {
+		t.Fatalf("monthly forecast or fractional rounding changed: %+v", l)
+	}
+	d.Suppliers[0].LeadTimeUnconfirmed = true
+	result, err = Calculate(context.Background(), d, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l = result.Products[0]
+	if !l.Blocked || l.OrderQuantity != 0 || l.SuggestedQuantity != 50 || len(result.Orders) != 0 || !slices.Contains(l.Warnings, "lead_time_unconfirmed") {
+		t.Fatalf("monthly calculation lost the supplier check: %+v", l)
 	}
 }

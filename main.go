@@ -58,8 +58,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Addr:              address,
 		Handler:           httpapi.New(store, logger, key, os.Getenv("CORS_ORIGIN")),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
@@ -70,6 +70,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Serve(listener) }()
 	logger.Info("backend listening", "address", listener.Addr().String())
+	// A TCP listener always supplies a host:port address, including the actual
+	// assigned port when HTTP_ADDR requests port 0.
+	listenHost, listenPort, _ := net.SplitHostPort(listener.Addr().String())
+	if listenIP := net.ParseIP(listenHost); listenIP != nil && listenIP.IsUnspecified() {
+		listenHost = "localhost"
+	}
+	fmt.Printf("\n  Server listening on port %s\n  Open: http://%s\n  Press Ctrl+C to stop.\n\n", listenPort, net.JoinHostPort(listenHost, listenPort))
 	select {
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {

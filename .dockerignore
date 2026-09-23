@@ -5,3 +5,7 @@ bin
 coverage.out
 node_modules
 test-results
+IEK
+systemElectric
+*.xlsx
+**/__pycache__

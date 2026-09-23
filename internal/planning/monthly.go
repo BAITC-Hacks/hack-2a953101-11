@@ -33,11 +33,10 @@ func monthlyDemand(rows []Monthly, factors [12]float64, asOf time.Time, r Reques
 		}
 		q := math.Max(0, m.Quantity-m.SpikeExcess)
 		if q < m.Quantity {
-			line.Adjustments = append(line.Adjustments, Adjustment{m.Date, int64(math.Round(m.Quantity)), q, "sales_spike"})
+			line.Adjustments = append(line.Adjustments, Adjustment{m.Date, m.Quantity, q, "sales_spike"})
 		}
 		obs = append(obs, observation{m, q / days / factor, m.Quantity / days, days, t})
 	}
-	line.Warnings = []string{}
 	if len(obs) == 0 {
 		line.DailyDemand = 0
 		line.RawDemand = 0
@@ -78,13 +77,13 @@ func monthlyDemand(rows []Monthly, factors [12]float64, asOf time.Time, r Reques
 		o := &obs[i]
 		if o.rate > threshold {
 			o.rate = baseline
-			line.Adjustments = append(line.Adjustments, Adjustment{o.m.Date, int64(math.Round(o.m.Quantity)), baseline * o.days * factors[int(o.month.Month())-1], "sales_spike"})
+			line.Adjustments = append(line.Adjustments, Adjustment{o.m.Date, o.m.Quantity, baseline * o.days * factors[int(o.month.Month())-1], "sales_spike"})
 		}
 		factor := factors[int(o.month.Month())-1]
 		point := HistoryPoint{Date: o.m.Date, Raw: o.m.Quantity, AfterSpikes: o.rate * o.days * factor, Stock: o.m.Stock, Seasonality: factor}
 		if o.m.Stock != nil && *o.m.Stock == 0 && fallback > 0 && o.rate <= fallback*0.2 {
 			o.rate = fallback
-			line.Adjustments = append(line.Adjustments, Adjustment{o.m.Date, int64(math.Round(o.m.Quantity)), fallback * o.days * factors[int(o.month.Month())-1], "stockout_compensation"})
+			line.Adjustments = append(line.Adjustments, Adjustment{o.m.Date, o.m.Quantity, fallback * o.days * factors[int(o.month.Month())-1], "stockout_compensation"})
 		}
 		point.AfterStockouts = o.rate * o.days * factor
 		line.Audit.History = append(line.Audit.History, point)
