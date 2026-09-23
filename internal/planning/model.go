@@ -2,6 +2,7 @@ package planning
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -16,6 +17,8 @@ type Supplier struct {
 }
 
 type Product struct {
+	Notes            string `json:"notes,omitempty"`
+	StockDate        string `json:"stock_date,omitempty"`
 	ID               string `json:"id"`
 	SKU              string `json:"sku"`
 	Name             string `json:"name"`
@@ -46,7 +49,23 @@ type Shipment struct {
 
 // Dataset is a complete snapshot for one warehouse. Shipments contain only open,
 // unreceived quantities; receipt must update stock and shipments in one import.
+type Monthly struct {
+	ProductID   string   `json:"product_id"`
+	Date        string   `json:"date"`
+	Quantity    float64  `json:"quantity"`
+	Stock       *float64 `json:"stock"`
+	SpikeExcess float64  `json:"spike_excess"`
+}
+type Seasonality struct {
+	SupplierID string  `json:"supplier_id"`
+	Month      int     `json:"month"`
+	Factor     float64 `json:"factor"`
+}
 type Dataset struct {
+	Monthly     []Monthly     `json:"monthly,omitempty"`
+	Seasonality []Seasonality `json:"seasonality,omitempty"`
+	SourceDate  string        `json:"source_date,omitempty"`
+
 	Suppliers []Supplier `json:"suppliers"`
 	Products  []Product  `json:"products"`
 	Sales     []Sale     `json:"sales"`
@@ -81,7 +100,7 @@ func (d Dataset) Validate() error {
 	}
 	products, skus := map[string]bool{}, map[string]bool{}
 	for _, p := range d.Products {
-		if !validText(p.ID) || !validText(p.Name) || !validText(p.SKU) || products[p.ID] || skus[p.SKU] || !suppliers[p.SupplierID] {
+		if !validText(p.ID) || (strings.TrimSpace(p.Name) == "" || len(p.Name) > 2000) || !validText(p.SKU) || products[p.ID] || skus[p.SKU] && d.SourceDate == "" || !suppliers[p.SupplierID] {
 			return fmt.Errorf("invalid or duplicate product %q, SKU, or supplier reference", p.ID)
 		}
 		if p.PackSize < 1 || p.PackSize > MaxQuantity || p.MinOrderQuantity < 0 || p.MinOrderQuantity > MaxQuantity {
@@ -122,6 +141,31 @@ func (d Dataset) Validate() error {
 			return fmt.Errorf("shipment: %w", err)
 		}
 		shipments[s.ID] = true
+	}
+	if d.SourceDate != "" {
+		if _, err := ParseDate(d.SourceDate); err != nil {
+			return err
+		}
+	}
+	seenMonths := map[string]bool{}
+	for _, m := range d.Monthly {
+		date, err := ParseDate(m.Date)
+		key := m.ProductID + ":" + m.Date
+		if err != nil || date.Day() != 1 || !products[m.ProductID] || seenMonths[key] || math.IsNaN(m.Quantity) || math.IsInf(m.Quantity, 0) || m.Quantity < 0 || m.Quantity > float64(MaxQuantity) || m.SpikeExcess < 0 || math.IsNaN(m.SpikeExcess) || math.IsInf(m.SpikeExcess, 0) {
+			return fmt.Errorf("invalid monthly history %s", key)
+		}
+		if m.Stock != nil && (*m.Stock < 0 || *m.Stock > float64(MaxQuantity) || math.IsNaN(*m.Stock) || math.IsInf(*m.Stock, 0)) {
+			return fmt.Errorf("invalid monthly stock %s", key)
+		}
+		seenMonths[key] = true
+	}
+	seenSeason := map[string]bool{}
+	for _, s := range d.Seasonality {
+		key := fmt.Sprintf("%s:%d", s.SupplierID, s.Month)
+		if !suppliers[s.SupplierID] || s.Month < 1 || s.Month > 12 || s.Factor <= 0 || s.Factor > 10 || math.IsNaN(s.Factor) || seenSeason[key] {
+			return fmt.Errorf("invalid seasonality %s", key)
+		}
+		seenSeason[key] = true
 	}
 	return nil
 }

@@ -17,10 +17,12 @@ import (
 	"unicode"
 
 	"github.com/electrokomplekt/replenishment/internal/planning"
+	"github.com/electrokomplekt/replenishment/internal/realdata"
 	"github.com/electrokomplekt/replenishment/internal/storage"
+	"github.com/electrokomplekt/replenishment/internal/webui"
 )
 
-const maxBodyBytes = 8 << 20
+const maxBodyBytes = 64 << 20
 
 type API struct {
 	store  *storage.Store
@@ -32,9 +34,18 @@ type API struct {
 func New(store *storage.Store, logger *slog.Logger, apiKey, allowedOrigin string) http.Handler {
 	a := &API{store: store, logger: logger, apiKey: apiKey, origin: allowedOrigin}
 	mux := http.NewServeMux()
+	webui.Register(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ready"}) })
 	mux.HandleFunc("GET /api/v1/dataset", a.getDataset)
+	mux.HandleFunc("GET /api/v1/excel-dataset", func(w http.ResponseWriter, r *http.Request) {
+		d, err := realdata.Load()
+		if err != nil {
+			problem(w, 500, "excel_error", err.Error())
+			return
+		}
+		writeJSON(w, 200, d)
+	})
 	mux.HandleFunc("PUT /api/v1/dataset", a.putDataset)
 	mux.HandleFunc("POST /api/v1/recommendations", a.recommend)
 	mux.HandleFunc("POST /api/v1/recommendations.csv", a.recommend)
@@ -82,7 +93,7 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			problem(w, 413, "body_too_large", "request body exceeds 8 MiB")
+			problem(w, 413, "body_too_large", "request body exceeds 64 MiB")
 		} else {
 			problem(w, 400, "invalid_json", err.Error())
 		}
@@ -138,6 +149,12 @@ func (a *API) putDataset(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) recommend(w http.ResponseWriter, r *http.Request) {
 	params := planning.DefaultRequest(time.Now())
+	initial := a.store.Read()
+	if initial.Data.SourceDate != "" {
+		date, _ := planning.ParseDate(initial.Data.SourceDate)
+		params.AsOf = date.AddDate(0, 0, 1).Format(planning.DateLayout)
+		params.LookbackDays = 365
+	}
 	if !decode(w, r, &params) {
 		return
 	}
@@ -156,11 +173,11 @@ func (a *API) recommend(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(r.URL.Path, ".csv") {
 		var body bytes.Buffer
 		writer := csv.NewWriter(&body)
-		_ = writer.Write([]string{"supplier_id", "supplier_name", "product_id", "sku", "product_name", "quantity", "expected_date", "daily_demand", "available_stock", "incoming_quantity"})
+		_ = writer.Write([]string{"supplier_id", "supplier_name", "product_id", "sku", "product_name", "quantity", "expected_date", "daily_demand", "available_stock", "incoming_quantity", "forecast_demand", "safety_stock", "explanation"})
 		for _, order := range result.Orders {
 			for _, line := range order.Lines {
 				_ = writer.Write([]string{safeCell(order.SupplierID), safeCell(order.SupplierName), safeCell(line.ProductID), safeCell(line.SKU), safeCell(line.Name),
-					strconv.FormatInt(line.OrderQuantity, 10), order.ExpectedDate, strconv.FormatFloat(line.DailyDemand, 'f', 6, 64), strconv.FormatInt(line.AvailableStock, 10), strconv.FormatInt(line.IncomingQuantity, 10)})
+					strconv.FormatInt(line.OrderQuantity, 10), order.ExpectedDate, strconv.FormatFloat(line.DailyDemand, 'f', 6, 64), strconv.FormatInt(line.AvailableStock, 10), strconv.FormatInt(line.IncomingQuantity, 10), strconv.FormatFloat(line.ForecastDemand, 'f', 2, 64), strconv.FormatFloat(line.SafetyStock, 'f', 2, 64), safeCell(line.Explanation)})
 			}
 		}
 		writer.Flush()
@@ -239,7 +256,7 @@ func (a *API) middleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if a.apiKey != "" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+		if a.apiKey != "" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !webui.IsPublic(r.URL.Path) {
 			expected := sha256.Sum256([]byte("Bearer " + a.apiKey))
 			actual := sha256.Sum256([]byte(r.Header.Get("Authorization")))
 			if subtle.ConstantTimeCompare(actual[:], expected[:]) != 1 {

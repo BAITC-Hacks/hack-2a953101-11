@@ -8,6 +8,6 @@ FROM alpine:3.23
 RUN addgroup -S app && adduser -S -G app -u 10001 app && mkdir /data && chown app:app /data
 COPY --from=build /backend /usr/local/bin/backend
 USER app
-ENV HTTP_ADDR=:8080 DATA_FILE=/data/warehouse.json
+ENV HTTP_ADDR=:8080 DATA_FILE=/data/warehouse.json SEED_EXCEL=1
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/backend"]

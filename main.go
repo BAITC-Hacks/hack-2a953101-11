@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/electrokomplekt/replenishment/internal/httpapi"
+	"github.com/electrokomplekt/replenishment/internal/realdata"
 	"github.com/electrokomplekt/replenishment/internal/storage"
 )
 
@@ -41,6 +42,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	store, err := storage.Open(env("DATA_FILE", "data/warehouse.json"))
 	if err != nil {
 		return err
+	}
+	// Seed only a new default warehouse; explicit DATA_FILE keeps existing workflows isolated.
+	if (os.Getenv("DATA_FILE") == "" || os.Getenv("SEED_EXCEL") == "1") && store.Read().Revision == 0 {
+		dataset, loadErr := realdata.Load()
+		if loadErr != nil {
+			return fmt.Errorf("load Excel snapshot: %w", loadErr)
+		}
+		if _, err = store.Replace(ctx, dataset, 0); err != nil {
+			return err
+		}
+		logger.Info("loaded supplied Excel data", "products", len(dataset.Products))
 	}
 	server := &http.Server{
 		Addr:              address,

@@ -38,7 +38,32 @@ type Adjustment struct {
 	Reason           string  `json:"reason"`
 }
 
+type HistoryPoint struct {
+	Date           string   `json:"date"`
+	Raw            float64  `json:"raw"`
+	AfterSpikes    float64  `json:"after_spikes"`
+	AfterStockouts float64  `json:"after_stockouts"`
+	Stock          *float64 `json:"stock"`
+	Seasonality    float64  `json:"seasonality"`
+}
+type DemandAudit struct {
+	History             []HistoryPoint `json:"history"`
+	HistoryDays         int            `json:"history_days"`
+	RawTotal            float64        `json:"raw_total"`
+	AfterSpikesTotal    float64        `json:"after_spikes_total"`
+	AfterStockoutsTotal float64        `json:"after_stockouts_total"`
+	BaseDailyDemand     float64        `json:"base_daily_demand"`
+	TrendDailyDemand    float64        `json:"trend_daily_demand"`
+}
 type Line struct {
+	Audit *DemandAudit `json:"audit,omitempty"`
+
+	ForecastDemand    float64 `json:"forecast_demand"`
+	SafetyStock       float64 `json:"safety_stock"`
+	TrendFactor       float64 `json:"trend_factor"`
+	SeasonalityFactor float64 `json:"seasonality_factor"`
+	Explanation       string  `json:"explanation"`
+
 	ProductID        string       `json:"product_id"`
 	SKU              string       `json:"sku"`
 	Name             string       `json:"name"`
@@ -113,6 +138,23 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 	for _, s := range d.Suppliers {
 		suppliers[s.ID] = s
 	}
+	monthly := map[string][]Monthly{}
+	for _, m := range d.Monthly {
+		monthly[m.ProductID] = append(monthly[m.ProductID], m)
+	}
+	seasonal := map[string][12]float64{}
+	for _, supplier := range d.Suppliers {
+		var f [12]float64
+		for i := range f {
+			f[i] = 1
+		}
+		seasonal[supplier.ID] = f
+	}
+	for _, s := range d.Seasonality {
+		f := seasonal[s.SupplierID]
+		f[s.Month-1] = s.Factor
+		seasonal[s.SupplierID] = f
+	}
 	orders := map[string]*Order{}
 	products := append([]Product(nil), d.Products...)
 	sort.Slice(products, func(i, j int) bool { return products[i].ID < products[j].ID })
@@ -163,6 +205,21 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 		if adjusted == 0 {
 			line.Warnings = append(line.Warnings, "no_regular_demand")
 		}
+		if len(d.Monthly) > 0 {
+			monthlyDemand(monthly[p.ID], seasonal[p.SupplierID], asOf, r, &line)
+			adjusted = line.DailyDemand * float64(r.LookbackDays)
+			if p.Notes != "" {
+				line.Warnings = append(line.Warnings, p.Notes)
+			}
+			if p.StockDate != "" && p.StockDate != r.AsOf {
+				line.Warnings = append(line.Warnings, "Остаток датирован "+p.StockDate+"; выбранная дата не восстанавливает движение склада.")
+			}
+		} else {
+			line.ForecastDemand = line.DailyDemand * float64(coverage-r.SafetyStockDays)
+			line.SafetyStock = line.DailyDemand * float64(r.SafetyStockDays)
+			line.TrendFactor = 1
+			line.SeasonalityFactor = 1
+		}
 		var arrivingDuringLead int64
 		arrival := asOf.AddDate(0, 0, supplier.LeadTimeDays).Format(DateLayout)
 		for _, s := range shipments[p.ID] {
@@ -188,6 +245,31 @@ func Calculate(ctx context.Context, d Dataset, r Request) (Result, error) {
 		if line.NetRequirement > 0 {
 			quantity := max(line.NetRequirement, p.MinOrderQuantity)
 			line.OrderQuantity = ((quantity + p.PackSize - 1) / p.PackSize) * p.PackSize
+		}
+		line.Explanation = fmt.Sprintf("Рекомендовано: %d ед. Прогноз спроса: %.1f; страховой запас: %.1f; доступный остаток: %d; учтено в пути: %d. Минимум: %d; округление до кратности %d. Сезонный коэффициент горизонта: %.3f; тренд: %.3f.", line.OrderQuantity, line.ForecastDemand, line.SafetyStock, line.AvailableStock, line.IncomingQuantity, p.MinOrderQuantity, p.PackSize, line.SeasonalityFactor, line.TrendFactor)
+		if line.Audit != nil {
+			a := line.Audit
+			line.Explanation = fmt.Sprintf("Продажи за %d дней полных месяцев: %.2f → после всплесков %.2f → после компенсации отсутствия %.2f. Базовый спрос без сезонности: %.4f ед./день; после тренда: %.4f. ", a.HistoryDays, a.RawTotal, a.AfterSpikesTotal, a.AfterStockoutsTotal, a.BaseDailyDemand, a.TrendDailyDemand) + line.Explanation
+		}
+		spikes, stockouts := 0, 0
+		for _, a := range line.Adjustments {
+			if a.Reason == "sales_spike" {
+				spikes++
+			}
+			if a.Reason == "stockout_compensation" {
+				stockouts++
+			}
+		}
+		if spikes > 0 {
+			line.Explanation += fmt.Sprintf(" Всплески скорректированы: %d.", spikes)
+		}
+		if stockouts > 0 {
+			line.Explanation += fmt.Sprintf(" Возможное отсутствие товара: восстановлен спрос за %d мес. по медиане нормальных периодов.", stockouts)
+		}
+		if p.Notes != "" {
+			line.Explanation += " " + p.Notes
+		}
+		if line.OrderQuantity > 0 {
 			order := orders[supplier.ID]
 			if order == nil {
 				order = &Order{SupplierID: supplier.ID, SupplierName: supplier.Name, ExpectedDate: arrival, Lines: []Line{}}

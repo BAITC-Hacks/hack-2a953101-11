@@ -131,6 +131,22 @@ func TestCORS(t *testing.T) {
 	}
 }
 
+func TestDashboardPublicWithProtectedAPI(t *testing.T) {
+	h := testAPI(t, "secret")
+	for _, path := range []string{"/", "/assets/app.js", "/assets/styles.css"} {
+		w := request(h, "GET", path, "", nil)
+		if w.Code != 200 {
+			t.Fatalf("public frontend %s: %d", path, w.Code)
+		}
+	}
+	for _, path := range []string{"/api/v1/dataset", "/api/v1/recommendations", "/assets/../api/v1/dataset"} {
+		w := request(h, "GET", path, "", nil)
+		if w.Code != 401 {
+			t.Fatalf("API auth bypass %s: %d", path, w.Code)
+		}
+	}
+}
+
 func TestCSVFormulaEscaping(t *testing.T) {
 	for _, input := range []string{"=SUM(A1:A2)", "+1", "-1", "@cmd", "\tname", "\rname", "  =1", "\n=1"} {
 		if !strings.HasPrefix(safeCell(input), "'") {

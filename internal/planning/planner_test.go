@@ -84,7 +84,7 @@ func TestShipmentsAndWarnings(t *testing.T) {
 
 func TestSupplierGroupingAndDeterminism(t *testing.T) {
 	d := fixture()
-	d.Products = append(d.Products, Product{"a", "SKU2", "Switch", "supplier", 1, 0})
+	d.Products = append(d.Products, Product{ID: "a", SKU: "SKU2", Name: "Switch", SupplierID: "supplier", PackSize: 1})
 	d.Stock = append(d.Stock, Stock{ProductID: "a"})
 	d.Sales = append(d.Sales, Sale{ProductID: "a", Date: "2026-09-01", Quantity: 7})
 	r, err := Calculate(context.Background(), d, Request{"2026-09-08", 7, 2, 1})
