@@ -564,11 +564,6 @@ function render() {
       "Рекомендации",
       "Обоснованные заказы для каждого поставщика.",
     ],
-    inventory: [
-      "Товары и остатки",
-      "Товары и остатки",
-      "Спрос, доступный запас и потребность в пополнении.",
-    ],
     shipments: [
       "Товары в пути",
       "Товары в пути",
@@ -582,9 +577,7 @@ function render() {
   $("#table-title").textContent =
     state.view === "shipments"
       ? "Ожидаемые поставки"
-      : state.view === "inventory"
-        ? "Товары на складе"
-        : "Рекомендации к закупке";
+      : "Рекомендации к закупке";
   $("#table-description").textContent =
     state.view === "shipments"
       ? "Неполученные товары из текущих заказов"
@@ -1097,7 +1090,7 @@ document.addEventListener("click", async (event) => {
   if (view) {
     state.page = 1;
     state.view = view.dataset.view;
-    state.filter = state.view === "inventory" ? "all" : "needed";
+    state.filter = "needed";
     $("#sidebar").classList.remove("open");
     $(".mobile-menu").setAttribute("aria-expanded", "false");
     syncSidebar();
